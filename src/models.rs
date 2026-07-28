@@ -192,6 +192,9 @@ pub struct HistoryEntry {
     pub downloaded_bytes: u64,
     pub added_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    /// Active download duration, excluding queue wait and pauses.
+    #[serde(default)]
+    pub download_time_secs: Option<f64>,
     pub output_dir: PathBuf,
     /// Post-processing stages with results
     pub stages: Vec<StageResult>,
@@ -202,6 +205,21 @@ pub struct HistoryEntry {
     /// Raw NZB XML data (for retry)
     #[serde(skip_serializing)]
     pub nzb_data: Option<Vec<u8>>,
+}
+
+/// Immutable statistics ledger row recorded when a job leaves the queue.
+/// Unlike history, these compact rows are retained when users clear or prune
+/// individual history entries so lifetime counters remain meaningful.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadStatistic {
+    pub job_id: String,
+    pub completed_at: DateTime<Utc>,
+    pub status: JobStatus,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub duration_secs: f64,
+    pub average_speed_bps: u64,
+    pub server_stats: Vec<ServerArticleStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -259,6 +259,56 @@ impl Database {
             )?;
         }
 
+        if version < 7 {
+            info!("Applying database migration v7: persistent download statistics");
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS download_statistics (
+                    job_id TEXT PRIMARY KEY,
+                    completed_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_bytes INTEGER NOT NULL DEFAULT 0,
+                    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                    duration_secs REAL NOT NULL DEFAULT 0,
+                    average_speed_bps INTEGER NOT NULL DEFAULT 0,
+                    server_stats TEXT NOT NULL DEFAULT '[]'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_download_statistics_completed
+                    ON download_statistics(completed_at DESC);
+
+                INSERT OR IGNORE INTO download_statistics (
+                    job_id, completed_at, status, total_bytes, downloaded_bytes,
+                    duration_secs, average_speed_bps, server_stats
+                )
+                SELECT id, completed_at, status, total_bytes, downloaded_bytes,
+                    MAX(0, (julianday(completed_at) - julianday(added_at)) * 86400.0),
+                    CASE
+                        WHEN julianday(completed_at) > julianday(added_at)
+                        THEN CAST(downloaded_bytes /
+                            ((julianday(completed_at) - julianday(added_at)) * 86400.0) AS INTEGER)
+                        ELSE 0
+                    END,
+                    COALESCE(server_stats, '[]')
+                FROM history;
+
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (7);
+                ",
+            )?;
+        }
+
+        if version < 8 {
+            info!("Applying database migration v8: active download duration");
+            self.conn.execute_batch(
+                "
+                ALTER TABLE history ADD COLUMN download_time_secs REAL;
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (8);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -338,6 +388,19 @@ impl Database {
         Ok(())
     }
 
+    /// Update the non-terminal, user-visible queue message for a job.
+    pub fn queue_update_error_message(
+        &self,
+        id: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET error_message=?2 WHERE id=?1",
+            params![id, error_message],
+        )?;
+        Ok(())
+    }
+
     /// Update job priority in the queue.
     pub fn queue_update_priority(&self, id: &str, priority: i32) -> Result<(), NzbError> {
         self.conn.execute(
@@ -406,8 +469,8 @@ impl Database {
         let server_stats_json = serde_json::to_string(&entry.server_stats).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, output_dir, stages, error_message, nzb_data, server_stats)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, nzb_data, server_stats)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 entry.id,
                 entry.name,
@@ -417,6 +480,7 @@ impl Database {
                 entry.downloaded_bytes as i64,
                 entry.added_at.to_rfc3339(),
                 entry.completed_at.to_rfc3339(),
+                entry.download_time_secs,
                 entry.output_dir.to_string_lossy().to_string(),
                 stages_json,
                 entry.error_message,
@@ -424,27 +488,81 @@ impl Database {
                 server_stats_json,
             ],
         )?;
+
+        let duration_secs = entry.download_time_secs.unwrap_or_else(|| {
+            (entry.completed_at - entry.added_at)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1000.0
+        });
+        let average_speed_bps = if duration_secs > 0.0 {
+            (entry.downloaded_bytes as f64 / duration_secs) as u64
+        } else {
+            0
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO download_statistics (
+                job_id, completed_at, status, total_bytes, downloaded_bytes,
+                duration_secs, average_speed_bps, server_stats
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.id,
+                entry.completed_at.to_rfc3339(),
+                entry.status.to_string(),
+                entry.total_bytes as i64,
+                entry.downloaded_bytes as i64,
+                duration_secs,
+                average_speed_bps as i64,
+                server_stats_json,
+            ],
+        )?;
         Ok(())
+    }
+
+    /// Return the compact, permanent download statistics ledger.
+    pub fn download_statistics_list(&self) -> Result<Vec<DownloadStatistic>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, completed_at, status, total_bytes, downloaded_bytes,
+                    duration_secs, average_speed_bps, server_stats
+             FROM download_statistics ORDER BY completed_at DESC",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let stats_json: String = row.get(7)?;
+                Ok(DownloadStatistic {
+                    job_id: row.get(0)?,
+                    completed_at: parse_datetime(&row.get::<_, String>(1)?),
+                    status: parse_status(&row.get::<_, String>(2)?),
+                    total_bytes: row.get::<_, i64>(3)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(4)? as u64,
+                    duration_secs: row.get(5)?,
+                    average_speed_bps: row.get::<_, i64>(6)? as u64,
+                    server_stats: serde_json::from_str(&stats_json).unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// List history entries, most recent first.
     pub fn history_list(&self, limit: usize) -> Result<Vec<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, output_dir, stages, error_message, server_stats,
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
              CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb
              FROM history ORDER BY completed_at DESC LIMIT ?1",
         )?;
 
         let entries = stmt
             .query_map(params![limit as i64], |row| {
-                let stages_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
+                let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
                 let stages: Vec<StageResult> =
                     serde_json::from_str(&stages_json).unwrap_or_default();
-                let stats_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+                let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
                 let server_stats: Vec<ServerArticleStats> =
                     serde_json::from_str(&stats_json).unwrap_or_default();
-                let has_nzb: i64 = row.get(12)?;
+                let has_nzb: i64 = row.get(13)?;
 
                 Ok(HistoryEntry {
                     id: row.get(0)?,
@@ -455,9 +573,10 @@ impl Database {
                     downloaded_bytes: row.get::<_, i64>(5)? as u64,
                     added_at: parse_datetime(&row.get::<_, String>(6)?),
                     completed_at: parse_datetime(&row.get::<_, String>(7)?),
-                    output_dir: row.get::<_, String>(8)?.into(),
+                    download_time_secs: row.get(8)?,
+                    output_dir: row.get::<_, String>(9)?.into(),
                     stages,
-                    error_message: row.get(10)?,
+                    error_message: row.get(11)?,
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
@@ -497,14 +616,14 @@ impl Database {
     pub fn history_get(&self, id: &str) -> Result<Option<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, output_dir, stages, error_message, server_stats
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats
              FROM history WHERE id = ?1",
         )?;
 
         let result = stmt.query_row(params![id], |row| {
-            let stages_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
+            let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
             let stages: Vec<StageResult> = serde_json::from_str(&stages_json).unwrap_or_default();
-            let stats_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+            let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
             let server_stats: Vec<ServerArticleStats> =
                 serde_json::from_str(&stats_json).unwrap_or_default();
 
@@ -517,9 +636,10 @@ impl Database {
                 downloaded_bytes: row.get::<_, i64>(5)? as u64,
                 added_at: parse_datetime(&row.get::<_, String>(6)?),
                 completed_at: parse_datetime(&row.get::<_, String>(7)?),
-                output_dir: row.get::<_, String>(8)?.into(),
+                download_time_secs: row.get(8)?,
+                output_dir: row.get::<_, String>(9)?.into(),
                 stages,
-                error_message: row.get(10)?,
+                error_message: row.get(11)?,
                 server_stats,
                 nzb_data: None,
             })
@@ -935,6 +1055,7 @@ mod tests {
             added_at: Utc::now(),
             completed_at: Utc::now(),
             output_dir: "/downloads/complete".into(),
+            download_time_secs: None,
             stages: vec![StageResult {
                 name: "Verify".into(),
                 status: StageStatus::Success,
@@ -1221,6 +1342,31 @@ mod tests {
         assert_eq!(loaded[0].server_stats.len(), 1);
         assert_eq!(loaded[0].server_stats[0].server_id, "srv-1");
         assert_eq!(loaded[0].server_stats[0].articles_downloaded, 100);
+    }
+
+    #[test]
+    fn test_download_statistics_survive_history_deletion() {
+        let db = Database::open_memory().unwrap();
+        let mut entry = make_history("stats-1", "Statistics Job");
+        entry.completed_at = Utc::now();
+        entry.added_at = entry.completed_at - chrono::Duration::seconds(10);
+        entry.downloaded_bytes = 10_000;
+        entry.server_stats = vec![ServerArticleStats {
+            server_id: "server-1".into(),
+            server_name: "Primary".into(),
+            articles_downloaded: 9,
+            articles_failed: 1,
+            bytes_downloaded: 10_000,
+        }];
+
+        db.history_insert(&entry).unwrap();
+        db.history_clear().unwrap();
+
+        let statistics = db.download_statistics_list().unwrap();
+        assert_eq!(statistics.len(), 1);
+        assert_eq!(statistics[0].job_id, "stats-1");
+        assert_eq!(statistics[0].average_speed_bps, 1_000);
+        assert_eq!(statistics[0].server_stats[0].articles_failed, 1);
     }
 
     // -----------------------------------------------------------------------
