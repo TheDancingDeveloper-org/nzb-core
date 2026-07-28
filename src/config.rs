@@ -71,6 +71,11 @@ pub struct GeneralConfig {
     /// post-processing if articles fail or unrar is unavailable.
     #[serde(default = "default_true")]
     pub direct_unpack: bool,
+    /// Maximum number of archive layers to extract after the outer archive.
+    /// `0` extracts only the outer archive; the default of `5` permits five
+    /// nested layers while preventing unbounded recursive extraction.
+    #[serde(default = "default_max_nested_archive_depth")]
+    pub max_nested_archive_depth: u8,
     /// Abort downloads that cannot possibly complete (too many missing articles).
     /// When enabled, the engine checks article failure rates and cancels jobs
     /// that have no chance of success. Default: true.
@@ -82,11 +87,10 @@ pub struct GeneralConfig {
     /// Requires `abort_hopeless` to also be enabled. Default: true.
     #[serde(default = "default_true")]
     pub early_failure_check: bool,
-    /// Minimum completion percentage required to keep downloading (excluding
-    /// par2 repair files). If the ratio of available content bytes to total
-    /// content bytes drops below this value, the job is aborted.
-    /// Range: 100.0–200.0. Default: 100.2 (par2 overhead means slight
-    /// over-completion is normal).
+    /// Minimum effective completion percentage required to keep downloading.
+    /// Effective completion includes available content plus usable PAR2
+    /// recovery capacity; values above 100 reserve a repair safety margin.
+    /// Range: 100.0–200.0. Default: 100.2.
     #[serde(default = "default_required_completion_pct")]
     pub required_completion_pct: f64,
     /// Maximum time in seconds to wait for a single NNTP article response
@@ -106,6 +110,10 @@ fn default_min_free_space() -> u64 {
 
 fn default_required_completion_pct() -> f64 {
     100.2
+}
+
+fn default_max_nested_archive_depth() -> u8 {
+    5
 }
 
 fn default_article_timeout_secs() -> u64 {
@@ -131,6 +139,7 @@ impl Default for GeneralConfig {
             watch_dir: None,
             rss_history_limit: default_rss_history_limit(),
             direct_unpack: true,
+            max_nested_archive_depth: default_max_nested_archive_depth(),
             abort_hopeless: true,
             early_failure_check: true,
             required_completion_pct: default_required_completion_pct(),
@@ -349,7 +358,7 @@ mod tests {
         assert_eq!(cfg.priority, 0);
         assert!(cfg.enabled);
         assert_eq!(cfg.retention, 0);
-        assert_eq!(cfg.pipelining, 1);
+        assert_eq!(cfg.pipelining, 4);
         assert!(!cfg.optional);
     }
 
@@ -368,6 +377,20 @@ mod tests {
         assert_eq!(cfg.min_free_space_bytes, 1_073_741_824);
         assert!(cfg.watch_dir.is_none());
         assert_eq!(cfg.rss_history_limit, Some(500));
+        assert!(cfg.direct_unpack);
+        assert_eq!(cfg.max_nested_archive_depth, 5);
+    }
+
+    #[test]
+    fn direct_unpack_can_be_explicitly_disabled() {
+        let cfg: GeneralConfig = toml::from_str("direct_unpack = false").unwrap();
+        assert!(!cfg.direct_unpack);
+    }
+
+    #[test]
+    fn nested_archive_depth_can_be_configured() {
+        let cfg: GeneralConfig = toml::from_str("max_nested_archive_depth = 2").unwrap();
+        assert_eq!(cfg.max_nested_archive_depth, 2);
     }
 
     #[test]
