@@ -309,6 +309,46 @@ impl Database {
             )?;
         }
 
+        if version < 9 {
+            info!("Applying database migration v9: per-article retry outcomes");
+            self.conn.execute_batch(
+                "
+                ALTER TABLE history ADD COLUMN retry_data BLOB;
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (9);
+                ",
+            )?;
+        }
+
+        if version < 10 {
+            info!("Applying database migration v10: per-article damage ledger");
+            // Created empty. `history.retry_data` (v9) is a retry checkpoint,
+            // not damage evidence, so there is no backfill: it carries no
+            // failure reason, per-server evidence, TTL, or server fingerprint
+            // to reconstruct a confirmed-missing record from. See WI-143.
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS damage_ledger (
+                    scope_id TEXT NOT NULL,
+                    file_index INTEGER NOT NULL,
+                    segment_number INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    evidence TEXT,
+                    first_refused_at TEXT,
+                    confirmed_at TEXT,
+                    expires_at TEXT,
+                    server_fingerprint TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scope_id, file_index, segment_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_damage_ledger_file
+                    ON damage_ledger (scope_id, file_index);
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (10);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -469,8 +509,8 @@ impl Database {
         let server_stats_json = serde_json::to_string(&entry.server_stats).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, nzb_data, server_stats)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, nzb_data, server_stats, retry_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 entry.id,
                 entry.name,
@@ -486,6 +526,7 @@ impl Database {
                 entry.error_message,
                 entry.nzb_data,
                 server_stats_json,
+                entry.retry_data,
             ],
         )?;
 
@@ -580,6 +621,7 @@ impl Database {
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
+                    retry_data: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -601,8 +643,30 @@ impl Database {
         }
     }
 
+    /// Get persisted per-article outcomes for a history retry.
+    pub fn history_get_retry_data(&self, id: &str) -> Result<Option<Vec<u8>>, NzbError> {
+        let result = self.conn.query_row(
+            "SELECT retry_data FROM history WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        );
+        match result {
+            Ok(data) => Ok(data),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(NzbError::Database(e)),
+        }
+    }
+
     /// Enforce history retention limit by deleting oldest entries.
+    ///
+    /// A limit of `0` is treated as "keep all" and is a no-op: the
+    /// `LIMIT 0` subquery would otherwise match nothing and delete every
+    /// row (GH #136). Callers normalize zero away already; this is the last
+    /// line of defence.
     pub fn history_enforce_retention(&self, max_entries: usize) -> Result<(), NzbError> {
+        if max_entries == 0 {
+            return Ok(());
+        }
         self.conn.execute(
             "DELETE FROM history WHERE id NOT IN (
                 SELECT id FROM history ORDER BY completed_at DESC LIMIT ?1
@@ -642,6 +706,7 @@ impl Database {
                 error_message: row.get(11)?,
                 server_stats,
                 nzb_data: None,
+                retry_data: None,
             })
         });
 
@@ -885,6 +950,15 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Remove downloaded RSS items older than `cutoff` and return the count.
+    pub fn rss_items_expire_downloaded(&self, cutoff: &str) -> Result<usize, NzbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM rss_items WHERE downloaded = 1 AND downloaded_at IS NOT NULL
+             AND downloaded_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
     fn map_rss_item(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<RssItem> {
         Ok(RssItem {
             id: row.get(0)?,
@@ -1065,6 +1139,7 @@ mod tests {
             error_message: None,
             server_stats: Vec::new(),
             nzb_data: None,
+            retry_data: None,
         }
     }
 
@@ -1302,6 +1377,19 @@ mod tests {
         assert_eq!(db.history_count().unwrap(), 5);
 
         db.history_enforce_retention(3).unwrap();
+        assert_eq!(db.history_count().unwrap(), 3);
+    }
+
+    /// GH #136: a retention limit of zero must not wipe history.
+    #[test]
+    fn test_history_enforce_retention_zero_keeps_all() {
+        let db = Database::open_memory().unwrap();
+        for i in 0..3 {
+            db.history_insert(&make_history(&format!("ret0-{i}"), &format!("Job {i}")))
+                .unwrap();
+        }
+
+        db.history_enforce_retention(0).unwrap();
         assert_eq!(db.history_count().unwrap(), 3);
     }
 
