@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
 
 use crate::error::NzbError;
@@ -56,7 +56,8 @@ impl Database {
 
         if version < 1 {
             info!("Applying database migration v1");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Active download queue
                 CREATE TABLE IF NOT EXISTS queue (
@@ -108,15 +109,15 @@ impl Database {
                     id TEXT PRIMARY KEY,
                     config TEXT NOT NULL -- JSON ServerConfig
                 );
-
-                INSERT INTO schema_version (version) VALUES (1);
                 ",
             )?;
+            commit_migration(tx, 1)?;
         }
 
         if version < 2 {
             info!("Applying database migration v2");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Add NZB data storage and server stats to history
                 ALTER TABLE history ADD COLUMN nzb_data BLOB;
@@ -127,27 +128,27 @@ impl Database {
 
                 -- Add NZB data to queue for preservation
                 ALTER TABLE queue ADD COLUMN nzb_raw BLOB;
-
-                UPDATE schema_version SET version = 2;
                 ",
             )?;
+            commit_migration(tx, 2)?;
         }
 
         if version < 3 {
             info!("Applying database migration v3");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Per-job log storage for history
                 ALTER TABLE history ADD COLUMN job_logs TEXT DEFAULT '[]';
-
-                UPDATE schema_version SET version = 3;
                 ",
             )?;
+            commit_migration(tx, 3)?;
         }
 
         if version < 4 {
             info!("Applying database migration v4");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- RSS feed items (persistent feed cache)
                 CREATE TABLE IF NOT EXISTS rss_items (
@@ -176,24 +177,23 @@ impl Database {
                     match_regex TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
-
-                UPDATE schema_version SET version = 4;
                 ",
             )?;
+            commit_migration(tx, 4)?;
         }
 
         if version < 5 {
             info!("Applying database migration v5: settings table");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-
-                UPDATE schema_version SET version = 5;
                 ",
             )?;
+            commit_migration(tx, 5)?;
         }
 
         // Ensure settings table exists for databases that jumped to v5
@@ -208,7 +208,8 @@ impl Database {
         #[cfg(feature = "groups-db")]
         if version < 6 {
             info!("Applying database migration v6: newsgroup browsing");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS groups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,15 +254,15 @@ impl Database {
                 CREATE TRIGGER IF NOT EXISTS headers_fts_del AFTER DELETE ON headers BEGIN
                     INSERT INTO headers_fts(headers_fts, rowid, subject, author) VALUES ('delete', old.id, old.subject, old.author);
                 END;
-
-                UPDATE schema_version SET version = 6;
                 ",
             )?;
+            commit_migration(tx, 6)?;
         }
 
         if version < 7 {
             info!("Applying database migration v7: persistent download statistics");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS download_statistics (
                     job_id TEXT PRIMARY KEY,
@@ -291,22 +292,201 @@ impl Database {
                     END,
                     COALESCE(server_stats, '[]')
                 FROM history;
-
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (7);
                 ",
             )?;
+            commit_migration(tx, 7)?;
         }
 
         if version < 8 {
             info!("Applying database migration v8: active download duration");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN download_time_secs REAL;
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (8);
                 ",
             )?;
+            commit_migration(tx, 8)?;
+        }
+
+        if version < 9 {
+            info!("Applying database migration v9: per-article retry outcomes");
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                ALTER TABLE history ADD COLUMN retry_data BLOB;
+                ",
+            )?;
+            commit_migration(tx, 9)?;
+        }
+
+        if version < 10 {
+            info!("Applying database migration v10: per-article damage ledger");
+            // Created empty. `history.retry_data` (v9) is a retry checkpoint,
+            // not damage evidence, so there is no backfill: it carries no
+            // failure reason, per-server evidence, TTL, or server fingerprint
+            // to reconstruct a confirmed-missing record from. See WI-143.
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS damage_ledger (
+                    scope_id TEXT NOT NULL,
+                    file_index INTEGER NOT NULL,
+                    segment_number INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    evidence TEXT,
+                    first_refused_at TEXT,
+                    confirmed_at TEXT,
+                    expires_at TEXT,
+                    server_fingerprint TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scope_id, file_index, segment_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_damage_ledger_file
+                    ON damage_ledger (scope_id, file_index);
+                ",
+            )?;
+            commit_migration(tx, 10)?;
+        }
+
+        if version < 11 {
+            info!("Applying database migration v11: idempotent queue admissions");
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                CREATE TABLE queue_admissions (
+                    idempotency_key TEXT PRIMARY KEY,
+                    payload_digest TEXT NOT NULL,
+                    job_id TEXT NOT NULL UNIQUE,
+                    accepted_at TEXT NOT NULL
+                );
+
+                CREATE INDEX idx_queue_admissions_job
+                    ON queue_admissions(job_id);
+                ",
+            )?;
+            commit_migration(tx, 11)?;
+        }
+
+        if version < 12 {
+            info!("Applying database migration v12: typed terminal failure codes");
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "
+                ALTER TABLE history ADD COLUMN failure_code TEXT;
+                UPDATE history
+                SET failure_code = 'download_failed'
+                WHERE LOWER(status) = 'failed' AND failure_code IS NULL;
+                ",
+            )?;
+            commit_migration(tx, 12)?;
+        }
+
+        if version < 13 {
+            info!("Applying database migration v13: per-job post-processing override");
+            // Partial schemas (as built by migration tests) may lack the
+            // queue table; only add the column where the table exists.
+            let has_queue: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'queue'",
+                [],
+                |row| row.get(0),
+            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            if has_queue > 0 {
+                tx.execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
+            }
+            commit_migration(tx, 13)?;
+        }
+
+        if version < 14 {
+            info!("Applying database migration v14: history post-processing level");
+            // Existing rows keep NULL: their level was never recorded.
+            let has_history: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            if has_history > 0 {
+                tx.execute_batch("ALTER TABLE history ADD COLUMN post_processing INTEGER;")?;
+            }
+            commit_migration(tx, 14)?;
+        }
+
+        if version < 15 {
+            info!("Applying database migration v15: per-job archive deletion");
+            // Partial schemas (as built by migration tests) may lack either
+            // table; only add the column where the table exists.
+            let mut table_exists_map = std::collections::HashMap::new();
+            for table in ["queue", "history"] {
+                let exists: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                table_exists_map.insert(table, exists > 0);
+            }
+            let tx = self.conn.unchecked_transaction()?;
+            for table in ["queue", "history"] {
+                if table_exists_map.get(&table).copied().unwrap_or(false) {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN delete_archives INTEGER;"
+                    ))?;
+                }
+            }
+            commit_migration(tx, 15)?;
+        }
+
+        if version < 16 {
+            info!("Applying database migration v16: header dedupe + per-group scan server");
+            // Existing databases may have duplicate header rows when the same
+            // article was fetched from more than one server. Deduplicate first
+            // (keeping the oldest row so read state survives), then enforce a
+            // unique index so it cannot happen again.
+            let has_headers: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'headers'",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_groups: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groups'",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_scan_server: i64 = if has_groups > 0 {
+                self.conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('groups') WHERE name = 'scan_server_id'",
+                    [],
+                    |row| row.get(0),
+                )?
+            } else {
+                0
+            };
+            let tx = self.conn.unchecked_transaction()?;
+            if has_headers > 0 {
+                tx.execute_batch(
+                    "
+                    UPDATE headers
+                    SET read = 1
+                    WHERE read = 0
+                      AND id IN (
+                          SELECT MIN(id)
+                          FROM headers
+                          GROUP BY group_id, message_id
+                          HAVING MAX(read) = 1
+                      );
+                    DELETE FROM headers
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM headers GROUP BY group_id, message_id
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_headers_group_msgid
+                        ON headers(group_id, message_id);
+                    ",
+                )?;
+            }
+            if has_groups > 0 && has_scan_server == 0 {
+                tx.execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
+            }
+            commit_migration(tx, 16)?;
         }
 
         Ok(())
@@ -334,13 +514,49 @@ impl Database {
     // Queue operations
     // -----------------------------------------------------------------------
 
-    /// Insert a new job into the queue.
-    pub fn queue_insert(&self, job: &NzbJob) -> Result<(), NzbError> {
-        self.conn.execute(
+    /// Atomically bind an idempotency key to one payload and queued job.
+    ///
+    /// The admission row intentionally has no foreign key to queue or history:
+    /// it remains authoritative after a job moves or bounded history is pruned.
+    pub fn queue_admit(
+        &mut self,
+        job: &NzbJob,
+        nzb_data: &[u8],
+        idempotency_key: &str,
+        payload_digest: &str,
+    ) -> Result<QueueAdmissionOutcome, NzbError> {
+        let transaction = self.conn.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT idempotency_key, payload_digest, job_id, accepted_at
+                 FROM queue_admissions WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| {
+                    Ok(QueueAdmission {
+                        idempotency_key: row.get(0)?,
+                        payload_digest: row.get(1)?,
+                        job_id: row.get(2)?,
+                        accepted_at: parse_datetime(&row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?;
+
+        if let Some(existing) = existing {
+            if existing.payload_digest != payload_digest {
+                return Err(NzbError::AdmissionConflict);
+            }
+            transaction.commit()?;
+            return Ok(QueueAdmissionOutcome::Existing(existing));
+        }
+
+        transaction.execute(
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
-             articles_downloaded, articles_failed, added_at, work_dir, output_dir, password)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
+             nzb_raw, pp_override, delete_archives)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+             ?16, ?17, ?18, ?19)",
             params![
                 job.id,
                 job.name,
@@ -358,6 +574,139 @@ impl Database {
                 job.work_dir.to_string_lossy().to_string(),
                 job.output_dir.to_string_lossy().to_string(),
                 job.password,
+                nzb_data,
+                job.pp_override,
+                job.delete_archives,
+            ],
+        )?;
+
+        let admission = QueueAdmission {
+            idempotency_key: idempotency_key.to_string(),
+            payload_digest: payload_digest.to_string(),
+            job_id: job.id.clone(),
+            accepted_at: job.added_at,
+        };
+        transaction.execute(
+            "INSERT INTO queue_admissions (
+                idempotency_key, payload_digest, job_id, accepted_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                admission.idempotency_key,
+                admission.payload_digest,
+                admission.job_id,
+                admission.accepted_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(QueueAdmissionOutcome::Inserted(admission))
+    }
+
+    /// Resolve one admission without relying on bounded queue/history lists.
+    pub fn queue_admission_observe(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<QueueAdmissionObservation>, NzbError> {
+        let admission = self
+            .conn
+            .query_row(
+                "SELECT idempotency_key, payload_digest, job_id, accepted_at
+                 FROM queue_admissions WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| {
+                    Ok(QueueAdmission {
+                        idempotency_key: row.get(0)?,
+                        payload_digest: row.get(1)?,
+                        job_id: row.get(2)?,
+                        accepted_at: parse_datetime(&row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?;
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+
+        // The durable terminal history row is authoritative over the lingering
+        // queue view, so it is consulted first: a job that has completed or
+        // failed carries its typed failure code here.
+        let history_state = self
+            .conn
+            .query_row(
+                "SELECT status, total_bytes, downloaded_bytes, completed_at, output_dir,
+                 error_message, failure_code FROM history WHERE id = ?1",
+                [&admission.job_id],
+                |row| {
+                    Ok(QueueAdmissionState::History {
+                        status: parse_status(&row.get::<_, String>(0)?),
+                        total_bytes: row.get::<_, i64>(1)? as u64,
+                        downloaded_bytes: row.get::<_, i64>(2)? as u64,
+                        completed_at: parse_datetime(&row.get::<_, String>(3)?),
+                        output_dir: row.get::<_, String>(4)?.into(),
+                        error_message: row.get(5)?,
+                        failure_code: parse_failure_code(row.get(6)?)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(state) = history_state {
+            return Ok(Some(QueueAdmissionObservation { admission, state }));
+        }
+
+        let queued_state = self
+            .conn
+            .query_row(
+                "SELECT status, total_bytes, downloaded_bytes, output_dir, error_message
+                 FROM queue WHERE id = ?1",
+                [&admission.job_id],
+                |row| {
+                    Ok(QueueAdmissionState::Queue {
+                        status: parse_status(&row.get::<_, String>(0)?),
+                        total_bytes: row.get::<_, i64>(1)? as u64,
+                        downloaded_bytes: row.get::<_, i64>(2)? as u64,
+                        output_dir: row.get::<_, String>(3)?.into(),
+                        error_message: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(state) = queued_state {
+            return Ok(Some(QueueAdmissionObservation { admission, state }));
+        }
+
+        Ok(Some(QueueAdmissionObservation {
+            admission,
+            state: QueueAdmissionState::Unobserved,
+        }))
+    }
+
+    /// Insert a new job into the queue.
+    pub fn queue_insert(&self, job: &NzbJob) -> Result<(), NzbError> {
+        self.conn.execute(
+            "INSERT INTO queue (id, name, category, status, priority, total_bytes,
+             downloaded_bytes, file_count, files_completed, article_count,
+             articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
+             pp_override, delete_archives)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+             ?17, ?18)",
+            params![
+                job.id,
+                job.name,
+                job.category,
+                job.status.to_string(),
+                job.priority as i32,
+                job.total_bytes as i64,
+                job.downloaded_bytes as i64,
+                job.file_count as i64,
+                job.files_completed as i64,
+                job.article_count as i64,
+                job.articles_downloaded as i64,
+                job.articles_failed as i64,
+                job.added_at.to_rfc3339(),
+                job.work_dir.to_string_lossy().to_string(),
+                job.output_dir.to_string_lossy().to_string(),
+                job.password,
+                job.pp_override,
+                job.delete_archives,
             ],
         )?;
         Ok(())
@@ -422,7 +771,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, priority, total_bytes, downloaded_bytes,
              file_count, files_completed, article_count, articles_downloaded, articles_failed,
-             added_at, completed_at, work_dir, output_dir, password, error_message
+             added_at, completed_at, work_dir, output_dir, password, error_message, pp_override,
+             delete_archives
              FROM queue ORDER BY priority DESC, added_at ASC",
         )?;
 
@@ -450,6 +800,8 @@ impl Database {
                     password: row.get(16)?,
                     error_message: row.get(17)?,
                     speed_bps: 0,
+                    pp_override: row.get(18)?,
+                    delete_archives: row.get(19)?,
                     server_stats: Vec::new(),
                     files: Vec::new(), // Loaded separately
                 })
@@ -465,12 +817,36 @@ impl Database {
 
     /// Move a completed/failed job to history.
     pub fn history_insert(&self, entry: &HistoryEntry) -> Result<(), NzbError> {
+        self.history_insert_with_carried_bytes(entry, 0)
+    }
+
+    /// Move a completed/failed job to history, excluding `carried_bytes`
+    /// from its statistics row. A history retry starts from the failed
+    /// attempt's checkpoint, whose bytes that attempt's own statistics row
+    /// already counts; the history row keeps the job's cumulative total.
+    pub fn history_insert_with_carried_bytes(
+        &self,
+        entry: &HistoryEntry,
+        carried_bytes: u64,
+    ) -> Result<(), NzbError> {
+        // Invariant: a Failed row carries exactly one typed failure code, and a
+        // non-Failed row carries none. This keeps the terminal history row a
+        // trustworthy source of the failure reason.
+        if (entry.status == JobStatus::Failed) != entry.failure_code.is_some() {
+            return Err(NzbError::Other("terminal_failure_code_invalid".to_string()));
+        }
         let stages_json = serde_json::to_string(&entry.stages).unwrap_or_default();
         let server_stats_json = serde_json::to_string(&entry.server_stats).unwrap_or_default();
-        self.conn.execute(
+        // The history row and its statistics-ledger row commit together, so a
+        // failed ledger write cannot leave a history entry the statistics
+        // never counted.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, nzb_data, server_stats)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message,
+             nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+             ?17, ?18)",
             params![
                 entry.id,
                 entry.name,
@@ -486,6 +862,10 @@ impl Database {
                 entry.error_message,
                 entry.nzb_data,
                 server_stats_json,
+                entry.retry_data,
+                entry.failure_code.map(|code| code.to_string()),
+                entry.post_processing,
+                entry.delete_archives,
             ],
         )?;
 
@@ -495,12 +875,13 @@ impl Database {
                 .max(0) as f64
                 / 1000.0
         });
+        let downloaded_bytes = entry.downloaded_bytes.saturating_sub(carried_bytes);
         let average_speed_bps = if duration_secs > 0.0 {
-            (entry.downloaded_bytes as f64 / duration_secs) as u64
+            (downloaded_bytes as f64 / duration_secs) as u64
         } else {
             0
         };
-        self.conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO download_statistics (
                 job_id, completed_at, status, total_bytes, downloaded_bytes,
                 duration_secs, average_speed_bps, server_stats
@@ -510,12 +891,13 @@ impl Database {
                 entry.completed_at.to_rfc3339(),
                 entry.status.to_string(),
                 entry.total_bytes as i64,
-                entry.downloaded_bytes as i64,
+                downloaded_bytes as i64,
                 duration_secs,
                 average_speed_bps as i64,
                 server_stats_json,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -550,7 +932,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb
+             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code,
+             post_processing, delete_archives
              FROM history ORDER BY completed_at DESC LIMIT ?1",
         )?;
 
@@ -577,9 +960,13 @@ impl Database {
                     output_dir: row.get::<_, String>(9)?.into(),
                     stages,
                     error_message: row.get(11)?,
+                    failure_code: parse_failure_code(row.get(14)?)?,
+                    post_processing: row.get(15)?,
+                    delete_archives: row.get(16)?,
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
+                    retry_data: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -601,8 +988,30 @@ impl Database {
         }
     }
 
+    /// Get persisted per-article outcomes for a history retry.
+    pub fn history_get_retry_data(&self, id: &str) -> Result<Option<Vec<u8>>, NzbError> {
+        let result = self.conn.query_row(
+            "SELECT retry_data FROM history WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        );
+        match result {
+            Ok(data) => Ok(data),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(NzbError::Database(e)),
+        }
+    }
+
     /// Enforce history retention limit by deleting oldest entries.
+    ///
+    /// A limit of `0` is treated as "keep all" and is a no-op: the
+    /// `LIMIT 0` subquery would otherwise match nothing and delete every
+    /// row (GH #136). Callers normalize zero away already; this is the last
+    /// line of defence.
     pub fn history_enforce_retention(&self, max_entries: usize) -> Result<(), NzbError> {
+        if max_entries == 0 {
+            return Ok(());
+        }
         self.conn.execute(
             "DELETE FROM history WHERE id NOT IN (
                 SELECT id FROM history ORDER BY completed_at DESC LIMIT ?1
@@ -616,7 +1025,8 @@ impl Database {
     pub fn history_get(&self, id: &str) -> Result<Option<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
+             failure_code, post_processing, delete_archives
              FROM history WHERE id = ?1",
         )?;
 
@@ -640,8 +1050,12 @@ impl Database {
                 output_dir: row.get::<_, String>(9)?.into(),
                 stages,
                 error_message: row.get(11)?,
+                failure_code: parse_failure_code(row.get(13)?)?,
+                post_processing: row.get(14)?,
+                delete_archives: row.get(15)?,
                 server_stats,
                 nzb_data: None,
+                retry_data: None,
             })
         });
 
@@ -885,6 +1299,15 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Remove downloaded RSS items older than `cutoff` and return the count.
+    pub fn rss_items_expire_downloaded(&self, cutoff: &str) -> Result<usize, NzbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM rss_items WHERE downloaded = 1 AND downloaded_at IS NOT NULL
+             AND downloaded_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
     fn map_rss_item(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<RssItem> {
         Ok(RssItem {
             id: row.get(0)?,
@@ -998,6 +1421,24 @@ fn parse_status(s: &str) -> JobStatus {
     }
 }
 
+fn parse_failure_code(value: Option<String>) -> rusqlite::Result<Option<JobFailureCode>> {
+    value
+        .map(|value| {
+            value.parse().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid terminal failure code",
+                    )
+                    .into(),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn parse_priority(v: i32) -> Priority {
     match v {
         0 => Priority::Low,
@@ -1012,6 +1453,38 @@ fn parse_datetime(s: &str) -> chrono::DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn commit_migration(tx: rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
+    tx.execute_batch(&format!(
+        "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES ({version});"
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn add_column_if_missing(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), NzbError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+            [table, column],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !exists {
+        tx.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1039,9 +1512,58 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn queue_round_trips_post_processing_override() {
+        let db = Database::open_memory().unwrap();
+        let mut overridden = make_job("pp-job", "PP Job");
+        overridden.pp_override = Some(1);
+        db.queue_insert(&overridden).unwrap();
+        db.queue_insert(&make_job("plain-job", "Plain Job"))
+            .unwrap();
+
+        let jobs = db.queue_list().unwrap();
+        let pp = |id: &str| jobs.iter().find(|job| job.id == id).unwrap().pp_override;
+        assert_eq!(pp("pp-job"), Some(1));
+        assert_eq!(pp("plain-job"), None);
+    }
+
+    #[test]
+    fn queue_and_history_round_trip_delete_archives() {
+        let db = Database::open_memory().unwrap();
+        let mut keep = make_job("keep-job", "Keep Job");
+        keep.delete_archives = Some(false);
+        db.queue_insert(&keep).unwrap();
+        db.queue_insert(&make_job("plain-job", "Plain Job"))
+            .unwrap();
+        let jobs = db.queue_list().unwrap();
+        let flag = |id: &str| {
+            jobs.iter()
+                .find(|job| job.id == id)
+                .unwrap()
+                .delete_archives
+        };
+        assert_eq!(flag("keep-job"), Some(false));
+        assert_eq!(flag("plain-job"), None);
+
+        let mut stored = make_history("keep-history", "Keep History");
+        stored.delete_archives = Some(false);
+        db.history_insert(&stored).unwrap();
+        assert_eq!(
+            db.history_get("keep-history")
+                .unwrap()
+                .unwrap()
+                .delete_archives,
+            Some(false)
+        );
+        let listed = db.history_list(10).unwrap();
+        assert_eq!(listed[0].delete_archives, Some(false));
     }
 
     fn make_history(id: &str, name: &str) -> HistoryEntry {
@@ -1063,8 +1585,12 @@ mod tests {
                 duration_secs: 2.5,
             }],
             error_message: None,
+            failure_code: None,
+            post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
+            retry_data: None,
         }
     }
 
@@ -1108,6 +1634,197 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].name, "Test Download");
         assert_eq!(jobs[0].total_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn queue_admission_replays_exact_payload_and_rejects_conflict() {
+        let mut db = Database::open_memory().unwrap();
+        let job = make_job("admitted-job", "Admitted");
+        let inserted = db
+            .queue_admit(&job, b"payload", "request-key", "sha256:first")
+            .unwrap();
+        assert!(matches!(inserted, QueueAdmissionOutcome::Inserted(_)));
+
+        let replay = db
+            .queue_admit(
+                &make_job("unused-job", "Replay"),
+                b"payload",
+                "request-key",
+                "sha256:first",
+            )
+            .unwrap();
+        let QueueAdmissionOutcome::Existing(replay) = replay else {
+            panic!("exact replay should return the existing admission");
+        };
+        assert_eq!(replay.job_id, "admitted-job");
+        assert_eq!(db.queue_list().unwrap().len(), 1);
+
+        let conflict = db.queue_admit(
+            &make_job("conflicting-job", "Conflict"),
+            b"different",
+            "request-key",
+            "sha256:different",
+        );
+        assert!(matches!(conflict, Err(NzbError::AdmissionConflict)));
+        assert_eq!(db.queue_list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queue_admission_survives_reopen_and_outlives_queue_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.queue_admit(
+                &make_job("durable-job", "Durable"),
+                b"payload",
+                "durable-key",
+                "sha256:durable",
+            )
+            .unwrap();
+        }
+
+        let mut db = Database::open(&path).unwrap();
+        let observation = db.queue_admission_observe("durable-key").unwrap().unwrap();
+        assert_eq!(observation.admission.job_id, "durable-job");
+        assert!(matches!(
+            observation.state,
+            QueueAdmissionState::Queue { .. }
+        ));
+
+        db.queue_remove("durable-job").unwrap();
+        let observation = db.queue_admission_observe("durable-key").unwrap().unwrap();
+        assert_eq!(observation.state, QueueAdmissionState::Unobserved);
+
+        let replay = db
+            .queue_admit(
+                &make_job("new-job", "New"),
+                b"payload",
+                "durable-key",
+                "sha256:durable",
+            )
+            .unwrap();
+        let QueueAdmissionOutcome::Existing(replay) = replay else {
+            panic!("durable replay should preserve the original job identity");
+        };
+        assert_eq!(replay.job_id, "durable-job");
+        assert!(db.queue_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_round_trips_post_processing_level() {
+        let db = Database::open_memory().unwrap();
+        let mut stored = make_history("pp-level", "PP Level");
+        stored.post_processing = Some(1);
+        db.history_insert(&stored).unwrap();
+        db.history_insert(&make_history("pp-legacy", "Legacy"))
+            .unwrap();
+
+        assert_eq!(
+            db.history_get("pp-level").unwrap().unwrap().post_processing,
+            Some(1)
+        );
+        assert_eq!(
+            db.history_get("pp-legacy")
+                .unwrap()
+                .unwrap()
+                .post_processing,
+            None
+        );
+        let listed = db.history_list(10).unwrap();
+        let level = listed.iter().find(|entry| entry.id == "pp-level").unwrap();
+        assert_eq!(level.post_processing, Some(1));
+    }
+
+    #[test]
+    fn typed_failure_migration_backfills_only_failed_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE schema_version (version INTEGER NOT NULL);
+                INSERT INTO schema_version (version) VALUES (11);
+                CREATE TABLE history (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO history (id, status) VALUES
+                    ('failed-job', 'Failed'),
+                    ('completed-job', 'Completed');
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path).unwrap();
+        let failed: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT failure_code FROM history WHERE id = 'failed-job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT failure_code FROM history WHERE id = 'completed-job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed.as_deref(), Some("download_failed"));
+        assert_eq!(completed, None);
+    }
+
+    #[test]
+    fn queue_admission_prefers_typed_terminal_history_over_lingering_queue_view() {
+        let mut db = Database::open_memory().unwrap();
+        db.queue_admit(
+            &make_job("terminal-job", "Terminal"),
+            b"payload",
+            "terminal-key",
+            "sha256:terminal",
+        )
+        .unwrap();
+        let mut history = make_history("terminal-job", "Terminal");
+        history.status = JobStatus::Failed;
+        history.failure_code = Some(JobFailureCode::ArchiveInvalid);
+        history.error_message = Some("private extractor diagnostic".to_string());
+        db.history_insert(&history).unwrap();
+
+        let observation = db.queue_admission_observe("terminal-key").unwrap().unwrap();
+        assert!(matches!(
+            observation.state,
+            QueueAdmissionState::History {
+                status: JobStatus::Failed,
+                failure_code: Some(JobFailureCode::ArchiveInvalid),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_history_requires_failure_code_exactly_on_failure() {
+        let db = Database::open_memory().unwrap();
+        let mut failed = make_history("failed-job", "Failed");
+        failed.status = JobStatus::Failed;
+        assert!(matches!(
+            db.history_insert(&failed),
+            Err(NzbError::Other(code)) if code == "terminal_failure_code_invalid"
+        ));
+
+        failed.failure_code = Some(JobFailureCode::DownloadFailed);
+        db.history_insert(&failed).unwrap();
+
+        let mut completed = make_history("completed-job", "Completed");
+        completed.failure_code = Some(JobFailureCode::DownloadFailed);
+        assert!(matches!(
+            db.history_insert(&completed),
+            Err(NzbError::Other(code)) if code == "terminal_failure_code_invalid"
+        ));
     }
 
     #[test]
@@ -1305,6 +2022,19 @@ mod tests {
         assert_eq!(db.history_count().unwrap(), 3);
     }
 
+    /// GH #136: a retention limit of zero must not wipe history.
+    #[test]
+    fn test_history_enforce_retention_zero_keeps_all() {
+        let db = Database::open_memory().unwrap();
+        for i in 0..3 {
+            db.history_insert(&make_history(&format!("ret0-{i}"), &format!("Job {i}")))
+                .unwrap();
+        }
+
+        db.history_enforce_retention(0).unwrap();
+        assert_eq!(db.history_count().unwrap(), 3);
+    }
+
     #[test]
     fn test_history_store_and_get_logs() {
         let db = Database::open_memory().unwrap();
@@ -1345,6 +2075,23 @@ mod tests {
     }
 
     #[test]
+    fn test_download_statistics_exclude_carried_bytes() {
+        let db = Database::open_memory().unwrap();
+        let mut entry = make_history("retry-1", "Retried Job");
+        entry.downloaded_bytes = 10_000;
+        entry.download_time_secs = Some(2.0);
+
+        db.history_insert_with_carried_bytes(&entry, 6_000).unwrap();
+
+        // History keeps the job's cumulative progress; the statistics row
+        // counts only what this attempt fetched.
+        assert_eq!(db.history_list(1).unwrap()[0].downloaded_bytes, 10_000);
+        let statistics = db.download_statistics_list().unwrap();
+        assert_eq!(statistics[0].downloaded_bytes, 4_000);
+        assert_eq!(statistics[0].average_speed_bps, 2_000);
+    }
+
+    #[test]
     fn test_download_statistics_survive_history_deletion() {
         let db = Database::open_memory().unwrap();
         let mut entry = make_history("stats-1", "Statistics Job");
@@ -1367,6 +2114,35 @@ mod tests {
         assert_eq!(statistics[0].job_id, "stats-1");
         assert_eq!(statistics[0].average_speed_bps, 1_000);
         assert_eq!(statistics[0].server_stats[0].articles_failed, 1);
+    }
+
+    /// The history row and its statistics-ledger row are one logical write:
+    /// if the ledger insert fails, the history row must not be left behind.
+    #[test]
+    fn history_insert_is_atomic_with_statistics_ledger() {
+        let db = Database::open_memory().unwrap();
+        db.conn
+            .execute_batch("DROP TABLE download_statistics;")
+            .unwrap();
+
+        assert!(db.history_insert(&make_history("h-1", "Half")).is_err());
+        assert!(
+            db.history_get("h-1").unwrap().is_none(),
+            "history row must roll back with the failed statistics write"
+        );
+    }
+
+    /// A lock held briefly by another connection (backup tool, second
+    /// process) must be waited on, not turned into an immediate SQLITE_BUSY.
+    #[test]
+    fn open_sets_busy_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("queue.db")).unwrap();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert!(timeout_ms >= 5_000, "busy_timeout was {timeout_ms} ms");
     }
 
     // -----------------------------------------------------------------------
