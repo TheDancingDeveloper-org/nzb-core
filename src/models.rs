@@ -37,6 +37,50 @@ impl std::fmt::Display for JobStatus {
     }
 }
 
+/// Engine-owned reason a job reached a terminal Failed state.
+///
+/// These carry stable snake_case wire values so consumers key off a typed code
+/// instead of parsing human-readable diagnostic prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobFailureCode {
+    ArticlesUnavailable,
+    RepairFailed,
+    ArchivePasswordRequired,
+    ArchiveInvalid,
+    StorageUnavailable,
+    DownloadFailed,
+}
+
+impl std::fmt::Display for JobFailureCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArticlesUnavailable => write!(f, "articles_unavailable"),
+            Self::RepairFailed => write!(f, "repair_failed"),
+            Self::ArchivePasswordRequired => write!(f, "archive_password_required"),
+            Self::ArchiveInvalid => write!(f, "archive_invalid"),
+            Self::StorageUnavailable => write!(f, "storage_unavailable"),
+            Self::DownloadFailed => write!(f, "download_failed"),
+        }
+    }
+}
+
+impl std::str::FromStr for JobFailureCode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "articles_unavailable" => Ok(Self::ArticlesUnavailable),
+            "repair_failed" => Ok(Self::RepairFailed),
+            "archive_password_required" => Ok(Self::ArchivePasswordRequired),
+            "archive_invalid" => Ok(Self::ArchiveInvalid),
+            "storage_unavailable" => Ok(Self::StorageUnavailable),
+            "download_failed" => Ok(Self::DownloadFailed),
+            _ => Err(value.to_string()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Priority
 // ---------------------------------------------------------------------------
@@ -141,6 +185,16 @@ pub struct NzbJob {
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,
+    /// Per-job post-processing level overriding the category's (0=none,
+    /// 1=repair, 2=unpack, 3=repair+unpack), e.g. SABnzbd's `pp` parameter.
+    /// `None` uses the category setting.
+    #[serde(default)]
+    pub pp_override: Option<u8>,
+    /// Whether a successful unpack deletes the archive volumes it extracted.
+    /// `Some(false)` keeps them (SABnzbd `pp=2`, "+Unpack" without
+    /// "+Delete"); `None` or `Some(true)` deletes them, the default.
+    #[serde(default)]
+    pub delete_archives: Option<bool>,
     /// Files in this job
     #[serde(skip)]
     pub files: Vec<NzbFile>,
@@ -199,12 +253,26 @@ pub struct HistoryEntry {
     /// Post-processing stages with results
     pub stages: Vec<StageResult>,
     pub error_message: Option<String>,
+    pub failure_code: Option<JobFailureCode>,
+    /// Effective post-processing level the job ran with (0=none, 1=repair,
+    /// 2=unpack, 3=repair+unpack). `None` for rows recorded before it was
+    /// stored.
+    #[serde(default)]
+    pub post_processing: Option<u8>,
+    /// The job's [`NzbJob::delete_archives`] flag, so history reports an
+    /// unpack that kept its archives. `None` for rows recorded before it was
+    /// stored, or when the default (delete) applied.
+    #[serde(default)]
+    pub delete_archives: Option<bool>,
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,
     /// Raw NZB XML data (for retry)
     #[serde(skip_serializing)]
     pub nzb_data: Option<Vec<u8>>,
+    /// Serialized per-article outcomes used for missing-only retry.
+    #[serde(skip_serializing)]
+    pub retry_data: Option<Vec<u8>>,
 }
 
 /// Immutable statistics ledger row recorded when a job leaves the queue.
@@ -220,6 +288,53 @@ pub struct DownloadStatistic {
     pub duration_secs: f64,
     pub average_speed_bps: u64,
     pub server_stats: Vec<ServerArticleStats>,
+}
+
+/// Durable binding between a caller idempotency key and one admitted job.
+///
+/// This row intentionally outlives queue and history retention so a caller can
+/// resolve an ambiguous admission response without creating another job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueAdmission {
+    pub idempotency_key: String,
+    pub payload_digest: String,
+    pub job_id: String,
+    pub accepted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "location", rename_all = "snake_case")]
+pub enum QueueAdmissionState {
+    Queue {
+        status: JobStatus,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+        output_dir: PathBuf,
+        error_message: Option<String>,
+    },
+    History {
+        status: JobStatus,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+        completed_at: DateTime<Utc>,
+        output_dir: PathBuf,
+        error_message: Option<String>,
+        failure_code: Option<JobFailureCode>,
+    },
+    Unobserved,
+}
+
+/// Exact observation of a durable admission and its current engine location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueAdmissionObservation {
+    pub admission: QueueAdmission,
+    pub state: QueueAdmissionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAdmissionOutcome {
+    Inserted(QueueAdmission),
+    Existing(QueueAdmission),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,7 +389,7 @@ pub struct RssRule {
     pub id: String,
     /// Human-readable name for the rule
     pub name: String,
-    /// Which feed(s) this rule applies to (one or more feed names)
+    /// Which feed(s) this rule applies to; empty means every feed
     pub feed_names: Vec<String>,
     /// Category to assign to downloaded NZBs
     pub category: Option<String>,
@@ -373,6 +488,21 @@ mod tests {
         assert_eq!(JobStatus::PostProcessing.to_string(), "PostProcessing");
         assert_eq!(JobStatus::Completed.to_string(), "Completed");
         assert_eq!(JobStatus::Failed.to_string(), "Failed");
+    }
+
+    #[test]
+    fn terminal_failure_codes_have_stable_wire_values() {
+        let code = JobFailureCode::ArchivePasswordRequired;
+        assert_eq!(code.to_string(), "archive_password_required");
+        assert_eq!(
+            serde_json::to_string(&code).unwrap(),
+            "\"archive_password_required\""
+        );
+        assert_eq!(
+            "archive_password_required".parse(),
+            Ok(JobFailureCode::ArchivePasswordRequired)
+        );
+        assert!("private extractor prose".parse::<JobFailureCode>().is_err());
     }
 
     #[test]

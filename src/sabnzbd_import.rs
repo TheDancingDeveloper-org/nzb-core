@@ -79,6 +79,28 @@ pub struct ImportedGeneral {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Warn when an imported complete_dir/incomplete_dir isn't an absolute path.
+/// rustnzb creates these directories eagerly at startup via `create_dir_all`,
+/// which resolves a relative path against the process's working directory
+/// rather than any intended download volume — applying such a path produces
+/// a confusing crash far from the actual misconfiguration (see issue #62).
+fn warn_relative_dirs(general: &ImportedGeneral, warnings: &mut Vec<String>) {
+    if let Some(ref dir) = general.complete_dir
+        && !std::path::Path::new(dir).is_absolute()
+    {
+        warnings.push(format!(
+            "complete_dir '{dir}' is a relative path and must be made absolute before this import can be applied"
+        ));
+    }
+    if let Some(ref dir) = general.incomplete_dir
+        && !std::path::Path::new(dir).is_absolute()
+    {
+        warnings.push(format!(
+            "incomplete_dir '{dir}' is a relative path and must be made absolute before this import can be applied"
+        ));
+    }
+}
+
 /// Parse SABnzbd bandwidth limit string (e.g. "50M", "1G", "500K", "0", "").
 pub fn parse_bandwidth_limit(s: &str) -> u64 {
     let s = s.trim().trim_matches('"');
@@ -188,20 +210,35 @@ pub fn parse_sabnzbd_ini(content: &str) -> SabnzbdImportPreview {
             .map(|s| parse_bandwidth_limit(s))
             .unwrap_or(0),
     };
+    warn_relative_dirs(&general, &mut warnings);
 
     // --- Servers (from [servers] → [[name]]) ---
     let servers: Vec<ImportedServer> = sections
         .iter()
         .filter(|((section, subsection), _)| section == "servers" && !subsection.is_empty())
-        .map(|((_, _), kv)| build_imported_server(kv, false))
+        .map(|((_, subsection), kv)| {
+            let mut server = build_imported_server(kv, false);
+            // SABnzbd keys servers by their `[[section]]` header; fall back to
+            // it when the INI carries no (or an empty) inner name.
+            if server.name.is_empty() {
+                server.name = subsection.clone();
+            }
+            server
+        })
         .collect();
 
     // --- Categories (from [categories] → [[name]]) ---
     let categories: Vec<CategoryConfig> = sections
         .iter()
         .filter(|((section, subsection), _)| section == "categories" && !subsection.is_empty())
-        .map(|((_, _), kv)| {
-            let name = kv.get("name").map(|s| s.as_str()).unwrap_or("*");
+        .map(|((_, subsection), kv)| {
+            // The `[[section]]` header is SABnzbd's key for the category;
+            // use it when the inner `name` is absent or empty.
+            let name = kv
+                .get("name")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(subsection);
             let name = if name == "*" { "Default" } else { name };
 
             // Check for scripts
@@ -221,6 +258,7 @@ pub fn parse_sabnzbd_ini(content: &str) -> SabnzbdImportPreview {
                     .filter(|s| !s.is_empty())
                     .map(std::path::PathBuf::from),
                 post_processing: kv.get("pp").and_then(|s| s.parse().ok()).unwrap_or(3),
+                ..CategoryConfig::default()
             }
         })
         .collect();
@@ -256,6 +294,7 @@ pub fn parse_sabnzbd_ini(content: &str) -> SabnzbdImportPreview {
                 filter_regex,
                 enabled: kv.get("enable").map(|s| parse_ini_bool(s)).unwrap_or(true),
                 auto_download: false,
+                max_age_days: None,
             })
         })
         .collect();
@@ -313,6 +352,7 @@ pub fn parse_sabnzbd_api_response(json: &serde_json::Value) -> SabnzbdImportPrev
             .or_else(|| misc["bandwidth_limit"].as_u64())
             .unwrap_or(0),
     };
+    warn_relative_dirs(&general, &mut warnings);
 
     // --- Servers ---
     let servers: Vec<ImportedServer> = config["servers"]
@@ -400,6 +440,7 @@ pub fn parse_sabnzbd_api_response(json: &serde_json::Value) -> SabnzbdImportPrev
                             .as_u64()
                             .or_else(|| c["pp"].as_str().and_then(|p| p.parse().ok()))
                             .unwrap_or(3) as u8,
+                        ..CategoryConfig::default()
                     }
                 })
                 .collect()
@@ -434,6 +475,7 @@ fn build_imported_server(kv: &HashMap<String, String>, from_api: bool) -> Import
     ImportedServer {
         name: kv
             .get("displayname")
+            .filter(|s| !s.is_empty())
             .or(kv.get("name"))
             .cloned()
             .unwrap_or_default(),
@@ -528,6 +570,53 @@ mod tests {
         );
     }
 
+    /// The `[[section]]` header is the key SABnzbd stores categories and
+    /// servers under; an INI without an inner `name =` must fall back to it
+    /// instead of importing every category as "Default" and nameless servers.
+    #[test]
+    fn ini_import_falls_back_to_section_header_for_names() {
+        let preview = parse_sabnzbd_ini(
+            r#"
+            [servers]
+            [[news.example.test]]
+            host = news.example.test
+            [[backup]]
+            name = ""
+            displayname = ""
+            host = backup.example.test
+            [categories]
+            [[*]]
+            pp = 3
+            [[tv]]
+            dir = /complete/tv
+            [[movies]]
+            name = ""
+            "#,
+        );
+
+        let mut servers: Vec<_> = preview
+            .servers
+            .iter()
+            .map(|server| (server.name.as_str(), server.host.as_str()))
+            .collect();
+        servers.sort();
+        assert_eq!(
+            servers,
+            vec![
+                ("backup", "backup.example.test"),
+                ("news.example.test", "news.example.test"),
+            ]
+        );
+
+        let mut categories: Vec<_> = preview
+            .categories
+            .iter()
+            .map(|category| category.name.as_str())
+            .collect();
+        categories.sort();
+        assert_eq!(categories, vec!["Default", "movies", "tv"]);
+    }
+
     #[test]
     fn api_import_handles_string_numbers_and_masked_passwords() {
         let preview = parse_sabnzbd_api_response(&serde_json::json!({
@@ -546,6 +635,77 @@ mod tests {
         assert!(!preview.servers[0].enabled);
         assert!(preview.servers[0].password_masked);
         assert_eq!(preview.warnings.len(), 1);
+    }
+
+    #[test]
+    fn ini_import_warns_on_relative_complete_and_incomplete_dir() {
+        let preview = parse_sabnzbd_ini(
+            r#"
+            [misc]
+            complete_dir = Downloads
+            download_dir = Downloads/incomplete
+            "#,
+        );
+
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("complete_dir") && w.contains("Downloads")),
+            "expected a relative complete_dir warning, got: {:?}",
+            preview.warnings
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("incomplete_dir") && w.contains("Downloads/incomplete")),
+            "expected a relative incomplete_dir warning, got: {:?}",
+            preview.warnings
+        );
+    }
+
+    #[test]
+    fn ini_import_does_not_warn_on_absolute_complete_and_incomplete_dir() {
+        let preview = parse_sabnzbd_ini(
+            r#"
+            [misc]
+            complete_dir = /downloads/complete
+            download_dir = /downloads/incomplete
+            "#,
+        );
+
+        assert!(
+            preview.warnings.is_empty(),
+            "expected no warnings for absolute dirs, got: {:?}",
+            preview.warnings
+        );
+    }
+
+    #[test]
+    fn api_import_warns_on_relative_complete_and_incomplete_dir() {
+        let preview = parse_sabnzbd_api_response(&serde_json::json!({
+            "config": {
+                "misc": { "complete_dir": "Downloads", "download_dir": "Downloads/incomplete" }
+            }
+        }));
+
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("complete_dir") && w.contains("Downloads")),
+            "expected a relative complete_dir warning, got: {:?}",
+            preview.warnings
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("incomplete_dir") && w.contains("Downloads/incomplete")),
+            "expected a relative incomplete_dir warning, got: {:?}",
+            preview.warnings
+        );
     }
 
     proptest! {

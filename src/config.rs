@@ -54,10 +54,21 @@ pub struct GeneralConfig {
     pub log_level: String,
     /// Log file path (None = stdout only)
     pub log_file: Option<PathBuf>,
-    /// History retention: how many NZBs to keep in history (None = keep all)
+    /// History retention: how many NZBs to keep in history.
+    /// `None` or `Some(0)` both mean keep all; see [`normalize_history_retention`].
     pub history_retention: Option<usize>,
-    /// Max number of NZBs downloading simultaneously (default 1)
+    /// Max number of NZBs downloading simultaneously (default 1).
+    /// `0` means unlimited: every queued job may download at once.
     pub max_active_downloads: usize,
+    /// Max number of independent jobs in post-processing at once.
+    #[serde(default = "default_max_post_processing_jobs")]
+    pub max_post_processing_jobs: usize,
+    /// Max number of concurrent PAR2 verify/repair workers.
+    #[serde(default = "default_max_repair_workers")]
+    pub max_repair_workers: usize,
+    /// Max number of concurrent archive extraction workers.
+    #[serde(default = "default_max_extract_workers")]
+    pub max_extract_workers: usize,
     /// Minimum free disk space in bytes before pausing downloads (default 1 GB)
     #[serde(default = "default_min_free_space")]
     pub min_free_space_bytes: u64,
@@ -98,6 +109,49 @@ pub struct GeneralConfig {
     /// 0 = no timeout. Default: 30.
     #[serde(default = "default_article_timeout_secs")]
     pub article_timeout_secs: u64,
+    /// Sort queued jobs by remaining percentage whenever progress changes.
+    #[serde(default)]
+    pub auto_sort_remaining_pct: bool,
+    /// Remove downloaded RSS records after this many days. None keeps them.
+    #[serde(default)]
+    pub rss_downloaded_item_expiry_days: Option<u64>,
+    /// Optional directory containing post-processing scripts.
+    #[serde(default)]
+    pub scripts_dir: Option<PathBuf>,
+    /// Script run after a successful post-processing job.
+    #[serde(default)]
+    pub script_success: Option<PathBuf>,
+    /// Script run after a failed post-processing job.
+    #[serde(default)]
+    pub script_failure: Option<PathBuf>,
+    /// Maximum runtime for a post-processing script.
+    #[serde(default = "default_script_timeout_secs")]
+    pub script_timeout_secs: u64,
+    /// Maximum captured output retained from a post-processing script.
+    #[serde(default = "default_script_output_bytes")]
+    pub script_max_output_bytes: usize,
+    /// Allow server-side URL fetches (add-url, SABnzbd `addurl`, RSS feeds,
+    /// SABnzbd import) to reach private LAN addresses: RFC 1918,
+    /// carrier-grade NAT (100.64.0.0/10) and IPv6 unique-local. Loopback and
+    /// link-local addresses (127.0.0.1, ::1, the 169.254.169.254
+    /// cloud-metadata endpoint) stay blocked unless listed in
+    /// `fetch_allowed_hosts`. Default: false.
+    #[serde(default)]
+    pub fetch_allow_private: bool,
+    /// Hosts that server-side URL fetches may always reach, even when they
+    /// resolve to a non-public address. Each entry is an IP address, a CIDR
+    /// block (`172.16.0.0/12`, `fd00::/8`) or a hostname matched exactly
+    /// against the URL host (`prowlarr`, `nzbhydra.lan`). Default: empty.
+    #[serde(default)]
+    pub fetch_allowed_hosts: Vec<String>,
+    /// Most headers kept per group when fetching a group's headers; the
+    /// oldest are pruned first. 0 keeps all fetched headers. Default: 100000.
+    #[serde(default = "default_group_max_headers")]
+    pub group_max_headers: usize,
+}
+
+fn default_group_max_headers() -> usize {
+    100_000
 }
 
 fn default_rss_history_limit() -> Option<usize> {
@@ -106,6 +160,18 @@ fn default_rss_history_limit() -> Option<usize> {
 
 fn default_min_free_space() -> u64 {
     1_073_741_824 // 1 GB
+}
+
+fn default_max_post_processing_jobs() -> usize {
+    2
+}
+
+fn default_max_repair_workers() -> usize {
+    1
+}
+
+fn default_max_extract_workers() -> usize {
+    1
 }
 
 fn default_required_completion_pct() -> f64 {
@@ -118,6 +184,24 @@ fn default_max_nested_archive_depth() -> u8 {
 
 fn default_article_timeout_secs() -> u64 {
     30
+}
+
+/// Normalize a history retention limit so that `0` means "keep all".
+///
+/// SABnzbd users (and this codebase's own `speed_limit_bps`) treat `0` as
+/// unlimited. Enforcing a literal limit of zero would delete every history
+/// row immediately after each completion (GH #136), so a zero is folded into
+/// `None` at every entry point before it reaches the database.
+pub fn normalize_history_retention(limit: Option<usize>) -> Option<usize> {
+    limit.filter(|max| *max > 0)
+}
+
+fn default_script_timeout_secs() -> u64 {
+    300
+}
+
+fn default_script_output_bytes() -> usize {
+    1024 * 1024
 }
 
 impl Default for GeneralConfig {
@@ -135,6 +219,9 @@ impl Default for GeneralConfig {
             log_file: None,
             history_retention: None, // keep all
             max_active_downloads: 1,
+            max_post_processing_jobs: default_max_post_processing_jobs(),
+            max_repair_workers: default_max_repair_workers(),
+            max_extract_workers: default_max_extract_workers(),
             min_free_space_bytes: default_min_free_space(),
             watch_dir: None,
             rss_history_limit: default_rss_history_limit(),
@@ -144,6 +231,16 @@ impl Default for GeneralConfig {
             early_failure_check: true,
             required_completion_pct: default_required_completion_pct(),
             article_timeout_secs: default_article_timeout_secs(),
+            auto_sort_remaining_pct: false,
+            rss_downloaded_item_expiry_days: None,
+            scripts_dir: None,
+            script_success: None,
+            script_failure: None,
+            script_timeout_secs: default_script_timeout_secs(),
+            script_max_output_bytes: default_script_output_bytes(),
+            fetch_allow_private: false,
+            fetch_allowed_hosts: Vec::new(),
+            group_max_headers: default_group_max_headers(),
         }
     }
 }
@@ -214,6 +311,12 @@ pub struct CategoryConfig {
     pub output_dir: Option<PathBuf>,
     /// Post-processing level: 0=none, 1=repair, 2=unpack, 3=repair+unpack
     pub post_processing: u8,
+    /// Filename or relative-path glob patterns to remove after unpacking.
+    #[serde(default)]
+    pub cleanup_patterns: Vec<String>,
+    /// Extensions to remove after unpacking, including or omitting the dot.
+    #[serde(default)]
+    pub unwanted_extensions: Vec<String>,
 }
 
 impl Default for CategoryConfig {
@@ -222,7 +325,33 @@ impl Default for CategoryConfig {
             name: "Default".into(),
             output_dir: None,
             post_processing: 3,
+            cleanup_patterns: Vec::new(),
+            unwanted_extensions: Vec::new(),
         }
+    }
+}
+
+impl CategoryConfig {
+    /// Check the name and `output_dir` against the rules
+    /// `QueueManager::output_dir_for` applies when a job is enqueued, so an
+    /// entry that would make every job in the category fail can be refused
+    /// when it is saved. Returns a message suitable for an API client.
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if crate::path::safe_component(&self.name).is_none() {
+            return Err("category name must be a single non-empty path component \
+                 without '/', '\\', '..' or control characters");
+        }
+        if let Some(output_dir) = &self.output_dir {
+            // Only the shape of the override matters here, not where the
+            // complete directory lives.
+            if crate::path::category_output_root(std::path::Path::new("/"), output_dir).is_none() {
+                return Err(
+                    "category output_dir must be an absolute path, or a relative \
+                     path below the complete directory, without '..' or control characters",
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -233,22 +362,27 @@ pub struct RssFeedConfig {
     pub name: String,
     /// Feed URL (RSS 2.0 or Atom)
     pub url: String,
-    /// How often to poll, in seconds (default 900 = 15 minutes)
+    /// How often to poll, in seconds (default 900 = 15 minutes, minimum 60;
+    /// lower values are rejected by the API and clamped by the RSS monitor)
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     /// Category to assign to downloaded NZBs
     #[serde(default)]
     pub category: Option<String>,
-    /// Regex pattern to filter feed entries by title
+    /// Regex pattern to filter feed entries by title (Rust `regex` syntax,
+    /// e.g. `(?i)ubuntu|debian`; no `/.../flags` delimiters)
     #[serde(default)]
     pub filter_regex: Option<String>,
     /// Whether this feed is active
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Auto-download all items from this feed (no rules needed).
-    /// Ignored when filter_regex is set (use download rules instead).
+    /// Auto-download items from this feed without needing a rule: every item
+    /// that passes `filter_regex`, or every item when no filter is set.
     #[serde(default)]
     pub auto_download: bool,
+    /// Ignore entries older than this many days. None disables age filtering.
+    #[serde(default)]
+    pub max_age_days: Option<u64>,
 }
 
 fn default_poll_interval() -> u64 {
@@ -291,7 +425,8 @@ impl AppConfig {
         if path.exists() {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-            let config: AppConfig = toml::from_str(&contents)?;
+            let mut config: AppConfig = toml::from_str(&contents)?;
+            config.assign_missing_server_ids();
             Ok(config)
         } else {
             let config = AppConfig::default();
@@ -304,6 +439,24 @@ impl AppConfig {
                 )
             })?;
             Ok(config)
+        }
+    }
+
+    /// Give every server without an `id` a stable one derived from its host
+    /// and port, so a hand-written `[[servers]]` block may omit it.
+    pub fn assign_missing_server_ids(&mut self) {
+        for i in 0..self.servers.len() {
+            if !self.servers[i].id.trim().is_empty() {
+                continue;
+            }
+            let base = format!("{}-{}", self.servers[i].host.trim(), self.servers[i].port);
+            let mut candidate = base.clone();
+            let mut n = 2;
+            while self.servers.iter().any(|s| s.id == candidate) {
+                candidate = format!("{base}-{n}");
+                n += 1;
+            }
+            self.servers[i].id = candidate;
         }
     }
 
@@ -363,6 +516,41 @@ mod tests {
     }
 
     #[test]
+    fn config_with_minimal_server_block_loads() {
+        // `retention`, `ssl_verify`, `id` etc. omitted: used to fail startup
+        // with "missing field `retention`".
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[servers]]
+name = "Primary"
+host = "news.example.com"
+
+[[servers]]
+host = "news.example.com"
+
+[[servers]]
+id = "backup"
+host = "backup.example.com"
+port = 119
+ssl = false
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::load(&path).unwrap();
+        assert_eq!(config.servers.len(), 3);
+        assert_eq!(config.servers[0].id, "news.example.com-563");
+        assert_eq!(config.servers[1].id, "news.example.com-563-2");
+        assert_eq!(config.servers[2].id, "backup");
+        assert!(config.servers[0].ssl_verify);
+        assert!(config.servers[0].enabled);
+        assert_eq!(config.servers[0].retention, 0);
+        assert_eq!(config.servers[2].port, 119);
+    }
+
+    #[test]
     fn test_general_config_defaults() {
         let cfg = GeneralConfig::default();
         assert_eq!(cfg.listen_addr, "0.0.0.0");
@@ -374,11 +562,21 @@ mod tests {
         assert!(cfg.log_file.is_none());
         assert!(cfg.history_retention.is_none());
         assert_eq!(cfg.max_active_downloads, 1);
+        assert_eq!(cfg.max_post_processing_jobs, 2);
+        assert_eq!(cfg.max_repair_workers, 1);
+        assert_eq!(cfg.max_extract_workers, 1);
         assert_eq!(cfg.min_free_space_bytes, 1_073_741_824);
         assert!(cfg.watch_dir.is_none());
         assert_eq!(cfg.rss_history_limit, Some(500));
         assert!(cfg.direct_unpack);
         assert_eq!(cfg.max_nested_archive_depth, 5);
+    }
+
+    #[test]
+    fn zero_history_retention_normalizes_to_keep_all() {
+        assert_eq!(normalize_history_retention(Some(0)), None);
+        assert_eq!(normalize_history_retention(None), None);
+        assert_eq!(normalize_history_retention(Some(25)), Some(25));
     }
 
     #[test]
@@ -512,6 +710,7 @@ mod tests {
             name: "movies".into(),
             output_dir: Some("/movies".into()),
             post_processing: 3,
+            ..CategoryConfig::default()
         });
 
         assert!(cfg.category("Default").is_some());
@@ -533,12 +732,38 @@ mod tests {
     }
 
     #[test]
+    fn category_validate_matches_enqueue_rules() {
+        let category = |name: &str, output_dir: Option<&str>| CategoryConfig {
+            name: name.into(),
+            output_dir: output_dir.map(PathBuf::from),
+            ..CategoryConfig::default()
+        };
+        assert!(CategoryConfig::default().validate().is_ok());
+        assert!(category("*", None).validate().is_ok());
+        assert!(category("tv", Some("shows/tv")).validate().is_ok());
+        assert!(category("tv", Some("/srv/media/tv")).validate().is_ok());
+        for bad in [
+            category("", None),
+            category("..", None),
+            category("a/b", None),
+            category("a\\b", None),
+            category("a\tb", None),
+            category("tv", Some("")),
+            category("tv", Some("../../../etc")),
+            category("tv", Some("/srv/../etc")),
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn test_find_category_or_default() {
         let mut cfg = AppConfig::default();
         cfg.categories.push(CategoryConfig {
             name: "movies".into(),
             output_dir: None,
             post_processing: 3,
+            ..CategoryConfig::default()
         });
         assert_eq!(cfg.find_category_or_default("movies").name, "movies");
         assert_eq!(cfg.find_category_or_default("unknown").name, "Default");

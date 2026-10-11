@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use quick_xml::XmlVersion;
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use tracing::warn;
@@ -37,7 +39,6 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
     }
 
     let mut reader = Reader::from_reader(data);
-    reader.config_mut().trim_text(true);
     let decoder = reader.decoder();
 
     let mut files: Vec<NzbFile> = Vec::new();
@@ -49,18 +50,24 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
     let mut buf = Vec::new();
     let mut meta_password: Option<String> = None;
     let mut reading_password_meta = false;
+    // quick-xml >= 0.38 no longer unescapes text inline: `&amp;` arrives as a
+    // separate `GeneralRef` event between two `Text` events, and CDATA is its
+    // own event too. Element content is therefore accumulated here and only
+    // consumed when the element closes.
+    let mut text_buf = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
                 b"file" => {
+                    text_buf.clear();
                     let mut subject = String::new();
                     let mut date = 0i64;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
                             b"subject" => {
                                 subject = attr
-                                    .decode_and_unescape_value(decoder)
+                                    .decoded_and_normalized_value(XmlVersion::Explicit1_0, decoder)
                                     .map(|v| v.into_owned())
                                     .unwrap_or_else(|_| {
                                         String::from_utf8_lossy(&attr.value).into_owned()
@@ -80,9 +87,10 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
                     current_segments.clear();
                 }
                 b"groups" => in_groups = true,
-                b"group" => {}
+                b"group" => text_buf.clear(),
                 b"segments" => in_segments = true,
                 b"segment" => {
+                    text_buf.clear();
                     let mut number = 0u32;
                     let mut bytes = 0u64;
                     for attr in e.attributes().flatten() {
@@ -103,6 +111,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
                     });
                 }
                 b"meta" => {
+                    text_buf.clear();
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"type" && attr.value.as_ref() == b"password" {
                             reading_password_meta = true;
@@ -128,6 +137,23 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
                                 filename = %filename,
                                 dropped,
                                 "Dropped {dropped} invalid segment(s) (zero bytes, zero number, or empty message-ID)"
+                            );
+                        }
+
+                        // Segment numbers are the article identity used by the
+                        // assembler. Sort by number (stable, so the first
+                        // declaration of a duplicated number wins) and drop
+                        // re-declarations: a duplicate would otherwise be
+                        // counted twice and the file could never complete.
+                        current_segments.sort_by_key(|s| s.number);
+                        let before_dedup = current_segments.len();
+                        current_segments.dedup_by_key(|s| s.number);
+                        let duplicates = before_dedup - current_segments.len();
+                        if duplicates > 0 {
+                            warn!(
+                                filename = %filename,
+                                duplicates,
+                                "Dropped {duplicates} duplicate segment number(s); kept the first declaration"
                             );
                         }
 
@@ -170,24 +196,49 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
                     }
                 }
                 b"groups" => in_groups = false,
+                b"group" => {
+                    let group = text_buf.trim();
+                    if in_groups && !group.is_empty() {
+                        current_groups.push(group.to_string());
+                    }
+                    text_buf.clear();
+                }
                 b"segments" => in_segments = false,
+                b"segment" => {
+                    if in_segments && let Some(seg) = current_segments.last_mut() {
+                        seg.message_id = text_buf.trim().to_string();
+                    }
+                    text_buf.clear();
+                }
+                b"meta" => {
+                    if reading_password_meta {
+                        meta_password = Some(text_buf.trim().to_string());
+                        reading_password_meta = false;
+                    }
+                    text_buf.clear();
+                }
                 _ => {}
             },
-            Ok(Event::Text(ref t)) => {
-                let text = t.unescape().unwrap_or_default().into_owned();
-                if reading_password_meta {
-                    meta_password = Some(text);
-                    reading_password_meta = false;
-                } else if in_groups {
-                    current_groups.push(text);
-                } else if in_segments && let Some(seg) = current_segments.last_mut() {
-                    seg.message_id = text;
-                }
-            }
+            Ok(Event::Text(ref t)) => match t.decode() {
+                Ok(text) => text_buf.push_str(&text),
+                Err(_) => text_buf.push_str(&String::from_utf8_lossy(t)),
+            },
             // Some NZB generators wrap message-IDs in CDATA sections.
             Ok(Event::CData(ref c)) => {
-                if in_segments && let Some(seg) = current_segments.last_mut() {
-                    seg.message_id = String::from_utf8_lossy(c.as_ref()).into_owned();
+                text_buf.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            // `&amp;`, `&#38;`, `&#x26;` and friends inside element content.
+            Ok(Event::GeneralRef(ref r)) => {
+                let name = String::from_utf8_lossy(r.as_ref());
+                if let Some(ch) = resolve_char_ref(&name) {
+                    text_buf.push(ch);
+                } else if let Some(text) = resolve_predefined_entity(&name) {
+                    text_buf.push_str(text);
+                } else {
+                    // Unknown entity: keep it verbatim rather than dropping data.
+                    text_buf.push('&');
+                    text_buf.push_str(&name);
+                    text_buf.push(';');
                 }
             }
             Ok(Event::Eof) => break,
@@ -214,7 +265,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
 
     Ok(NzbJob {
         id: uuid::Uuid::new_v4().to_string(),
-        name: name.nfc().collect(),
+        name: crate::path::sanitize_job_name(name),
         category: "Default".into(),
         status: JobStatus::Queued,
         priority: Priority::Normal,
@@ -232,12 +283,24 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
         password: meta_password,
         error_message: None,
         speed_bps: 0,
+        pp_override: None,
+        delete_archives: None,
         server_stats: Vec::new(),
         files,
     })
 }
 
 /// Parse NZB from a file path.
+/// Resolve a numeric character reference body (`#38` or `#x26`) to its char.
+fn resolve_char_ref(name: &str) -> Option<char> {
+    let digits = name.strip_prefix('#')?;
+    let code = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    char::from_u32(code)
+}
+
 pub fn parse_nzb_file(path: &Path) -> Result<NzbJob, NzbError> {
     let data = std::fs::read(path)?;
     let name = path
@@ -276,6 +339,9 @@ fn sanitize_filename(name: &str) -> String {
             '<' | '>' | ':' | '"' | '|' | '?' | '*' => {}
             // Control characters (including null)
             c if c.is_control() => {}
+            // Bidi overrides/isolates/marks and zero-width spaces enable
+            // RTL-override filename spoofing; ZWJ/ZWNJ are kept.
+            c if crate::path::is_bidi_or_invisible_control(c) => {}
             // Backslash → forward slash is also risky; strip it
             '\\' => {}
             _ => out.push(ch),
@@ -488,6 +554,42 @@ mod tests {
         assert_eq!(job.files[0].articles[0].message_id, "article1@example.com");
     }
 
+    /// quick-xml >= 0.38 splits element content around entity references, so
+    /// a message-ID or password containing `&amp;` must be reassembled rather
+    /// than truncated to its last fragment.
+    #[test]
+    fn test_parse_nzb_entities_in_text_and_attributes() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="password">my &amp; secret &#38; more &#x26; end</meta>
+  </head>
+  <file poster="p@x.com" date="100" subject="&quot;a &amp; b.rar&quot; (1/1)">
+    <groups>
+      <group>alt.binaries.test</group>
+      <group>alt.binaries.b&amp;w</group>
+    </groups>
+    <segments>
+      <segment number="1" bytes="100">part1&amp;2@example.com</segment>
+      <segment number="2" bytes="100"><![CDATA[cdata&raw@example.com]]></segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let job = parse_nzb("entities", nzb_data).unwrap();
+        assert_eq!(job.password.as_deref(), Some("my & secret & more & end"));
+        assert_eq!(job.files[0].filename, "a & b.rar");
+        assert_eq!(
+            job.files[0].groups,
+            vec![
+                "alt.binaries.test".to_string(),
+                "alt.binaries.b&w".to_string()
+            ]
+        );
+        assert_eq!(job.files[0].articles[0].message_id, "part1&2@example.com");
+        assert_eq!(job.files[0].articles[1].message_id, "cdata&raw@example.com");
+    }
+
     #[test]
     fn test_parse_nzb_multiple_files() {
         let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -635,10 +737,63 @@ mod tests {
         let job = parse_nzb("order", nzb_data).unwrap();
         let articles = &job.files[0].articles;
         assert_eq!(articles.len(), 3);
-        // Segments should be in the order they appear in the XML
-        assert_eq!(articles[0].segment_number, 3);
-        assert_eq!(articles[1].segment_number, 1);
-        assert_eq!(articles[2].segment_number, 2);
+        // Segments are sorted by segment number regardless of XML order,
+        // and each keeps the message-ID it was declared with.
+        assert_eq!(articles[0].segment_number, 1);
+        assert_eq!(articles[0].message_id, "seg1@x");
+        assert_eq!(articles[1].segment_number, 2);
+        assert_eq!(articles[1].message_id, "seg2@x");
+        assert_eq!(articles[2].segment_number, 3);
+        assert_eq!(articles[2].message_id, "seg3@x");
+    }
+
+    #[test]
+    fn test_parse_nzb_duplicate_segment_numbers_keep_first() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@x.com" date="100" subject="test.rar (1/1)">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment number="2" bytes="200">seg2@x</segment>
+      <segment number="1" bytes="100">seg1-first@x</segment>
+      <segment number="1" bytes="999">seg1-repost@x</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let job = parse_nzb("dups", nzb_data).unwrap();
+        let file = &job.files[0];
+        let numbers: Vec<u32> = file.articles.iter().map(|a| a.segment_number).collect();
+        assert_eq!(numbers, vec![1, 2]);
+        assert_eq!(file.articles[0].message_id, "seg1-first@x");
+        assert_eq!(file.articles[0].bytes, 100);
+        // File size and job counters must not include the dropped duplicate.
+        assert_eq!(file.bytes, 300);
+        assert_eq!(job.total_bytes, 300);
+        assert_eq!(job.article_count, 2);
+    }
+
+    #[test]
+    fn test_parse_nzb_segment_gaps_are_preserved_sorted() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@x.com" date="100" subject="test.rar (1/1)">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment number="4" bytes="100">seg4@x</segment>
+      <segment number="1" bytes="100">seg1@x</segment>
+      <segment number="2" bytes="100">seg2@x</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let job = parse_nzb("gaps", nzb_data).unwrap();
+        let numbers: Vec<u32> = job.files[0]
+            .articles
+            .iter()
+            .map(|a| a.segment_number)
+            .collect();
+        assert_eq!(numbers, vec![1, 2, 4]);
     }
 
     #[test]
@@ -778,6 +933,31 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_strips_bidi_and_invisible_controls() {
+        assert_eq!(sanitize_filename("clip\u{202E}4pm.exe"), "clip4pm.exe");
+        assert_eq!(
+            sanitize_filename("\u{FEFF}\u{2066}a\u{200B}b\u{200E}.mkv\u{2069}"),
+            "ab.mkv"
+        );
+        assert_eq!(sanitize_filename("\u{202E}\u{200F}"), "unnamed");
+    }
+
+    #[test]
+    fn test_sanitize_keeps_joiners_cjk_and_accents() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg";
+        assert_eq!(sanitize_filename(family), family);
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}.txt";
+        assert_eq!(sanitize_filename(persian), persian);
+        for text in [
+            "進撃の巨人 第1話.mkv",
+            "Amélie.Poulain.mkv",
+            "Ñandú über straße.rar",
+        ] {
+            assert_eq!(sanitize_filename(text), text);
+        }
+    }
+
+    #[test]
     fn test_parse_nzb_normalizes_job_name() {
         let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -793,6 +973,29 @@ mod tests {
         let job = parse_nzb("caf\u{0065}\u{0301}", nzb_data).unwrap();
         // Job name should be NFC
         assert_eq!(job.name, "caf\u{00E9}");
+    }
+
+    #[test]
+    fn test_parse_nzb_sanitizes_job_name() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@x.com" date="100" subject="test.rar (1/1)">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment number="1" bytes="100">s@x</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        for (input, expected) in [
+            ("a:b*c?d", "a-b_c_d"),
+            (".", "unnamed"),
+            ("Trailing.Dot.", "Trailing.Dot"),
+            (" padded ", "padded"),
+            ("CON", "_CON"),
+        ] {
+            assert_eq!(parse_nzb(input, nzb_data).unwrap().name, expected);
+        }
     }
 
     #[test]
