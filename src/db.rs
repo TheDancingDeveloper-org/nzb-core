@@ -2,6 +2,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::error::NzbError;
@@ -9,6 +10,16 @@ use crate::models::*;
 
 #[allow(dead_code)]
 const SCHEMA_VERSION: u32 = 1;
+
+/// The content digest that recognises a repeated NZB: `sha256:` followed by
+/// the lowercase hex SHA-256 of the payload.
+pub fn nzb_digest(payload: &[u8]) -> String {
+    let hex: String = Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
 
 /// Database handle for queue and history persistence.
 pub struct Database {
@@ -39,24 +50,45 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<(), NzbError> {
-        self.conn.execute_batch(
+        // Apply every pending migration in one transaction.
+        //
+        // Each migration used to commit separately and stamp `schema_version`
+        // on its own. That cost one durable commit per migration — 31 fsyncs
+        // to create a fresh database, measured — and on a contended disk (the
+        // CI container shares a dind volume with concurrent builds) the serial
+        // commits dominated start-up: at 600 ms per fsync the backend took over
+        // 15 s to open its database, never reached the HTTP bind, and global
+        // setup timed out without a single log line (the migration notices are
+        // INFO, the e2e config logs at WARN).
+        //
+        // Batching leaves about ten fsyncs (SQLite's own commit and WAL
+        // bookkeeping), and the same 600 ms shim now reaches health in 4.3 s
+        // rather than failing, or 10.7 s at 1.5 s per fsync.
+        //
+        // Each migration still logs as it runs. The version row is written
+        // once, after the last one, and the batch rolls back together: an
+        // interrupted upgrade leaves the database at its previous version
+        // rather than half-migrated.
+        let tx = self.conn.unchecked_transaction()?;
+        // Creating the bookkeeping table is part of the same batch: as its own
+        // statement it would be a second durable commit before the first
+        // migration even ran.
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
             );",
         )?;
-
-        let version: u32 = self
-            .conn
+        let version: u32 = tx
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version",
                 [],
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        let mut applied = version;
 
         if version < 1 {
             info!("Applying database migration v1");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- Active download queue
@@ -111,12 +143,11 @@ impl Database {
                 );
                 ",
             )?;
-            commit_migration(tx, 1)?;
+            applied = 1;
         }
 
         if version < 2 {
             info!("Applying database migration v2");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- Add NZB data storage and server stats to history
@@ -130,24 +161,22 @@ impl Database {
                 ALTER TABLE queue ADD COLUMN nzb_raw BLOB;
                 ",
             )?;
-            commit_migration(tx, 2)?;
+            applied = 2;
         }
 
         if version < 3 {
             info!("Applying database migration v3");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- Per-job log storage for history
                 ALTER TABLE history ADD COLUMN job_logs TEXT DEFAULT '[]';
                 ",
             )?;
-            commit_migration(tx, 3)?;
+            applied = 3;
         }
 
         if version < 4 {
             info!("Applying database migration v4");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- RSS feed items (persistent feed cache)
@@ -179,12 +208,11 @@ impl Database {
                 );
                 ",
             )?;
-            commit_migration(tx, 4)?;
+            applied = 4;
         }
 
         if version < 5 {
             info!("Applying database migration v5: settings table");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS settings (
@@ -193,12 +221,12 @@ impl Database {
                 );
                 ",
             )?;
-            commit_migration(tx, 5)?;
+            applied = 5;
         }
 
         // Ensure settings table exists for databases that jumped to v5
         // with groups tables but without settings (pre-extraction rustnzbd)
-        self.conn.execute_batch(
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -208,7 +236,6 @@ impl Database {
         #[cfg(feature = "groups-db")]
         if version < 6 {
             info!("Applying database migration v6: newsgroup browsing");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS groups (
@@ -256,12 +283,11 @@ impl Database {
                 END;
                 ",
             )?;
-            commit_migration(tx, 6)?;
+            applied = 6;
         }
 
         if version < 7 {
             info!("Applying database migration v7: persistent download statistics");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS download_statistics (
@@ -294,29 +320,27 @@ impl Database {
                 FROM history;
                 ",
             )?;
-            commit_migration(tx, 7)?;
+            applied = 7;
         }
 
         if version < 8 {
             info!("Applying database migration v8: active download duration");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN download_time_secs REAL;
                 ",
             )?;
-            commit_migration(tx, 8)?;
+            applied = 8;
         }
 
         if version < 9 {
             info!("Applying database migration v9: per-article retry outcomes");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN retry_data BLOB;
                 ",
             )?;
-            commit_migration(tx, 9)?;
+            applied = 9;
         }
 
         if version < 10 {
@@ -325,7 +349,6 @@ impl Database {
             // not damage evidence, so there is no backfill: it carries no
             // failure reason, per-server evidence, TTL, or server fingerprint
             // to reconstruct a confirmed-missing record from. See WI-143.
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS damage_ledger (
@@ -345,12 +368,11 @@ impl Database {
                     ON damage_ledger (scope_id, file_index);
                 ",
             )?;
-            commit_migration(tx, 10)?;
+            applied = 10;
         }
 
         if version < 11 {
             info!("Applying database migration v11: idempotent queue admissions");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE queue_admissions (
@@ -364,12 +386,11 @@ impl Database {
                     ON queue_admissions(job_id);
                 ",
             )?;
-            commit_migration(tx, 11)?;
+            applied = 11;
         }
 
         if version < 12 {
             info!("Applying database migration v12: typed terminal failure codes");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN failure_code TEXT;
@@ -378,7 +399,7 @@ impl Database {
                 WHERE LOWER(status) = 'failed' AND failure_code IS NULL;
                 ",
             )?;
-            commit_migration(tx, 12)?;
+            applied = 12;
         }
 
         if version < 13 {
@@ -390,11 +411,10 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            let tx = self.conn.unchecked_transaction()?;
             if has_queue > 0 {
                 tx.execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
             }
-            commit_migration(tx, 13)?;
+            applied = 13;
         }
 
         if version < 14 {
@@ -405,11 +425,10 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            let tx = self.conn.unchecked_transaction()?;
             if has_history > 0 {
                 tx.execute_batch("ALTER TABLE history ADD COLUMN post_processing INTEGER;")?;
             }
-            commit_migration(tx, 14)?;
+            applied = 14;
         }
 
         if version < 15 {
@@ -425,7 +444,6 @@ impl Database {
                 )?;
                 table_exists_map.insert(table, exists > 0);
             }
-            let tx = self.conn.unchecked_transaction()?;
             for table in ["queue", "history"] {
                 if table_exists_map.get(&table).copied().unwrap_or(false) {
                     tx.execute_batch(&format!(
@@ -433,7 +451,7 @@ impl Database {
                     ))?;
                 }
             }
-            commit_migration(tx, 15)?;
+            applied = 15;
         }
 
         if version < 16 {
@@ -461,7 +479,6 @@ impl Database {
             } else {
                 0
             };
-            let tx = self.conn.unchecked_transaction()?;
             if has_headers > 0 {
                 tx.execute_batch(
                     "
@@ -486,7 +503,340 @@ impl Database {
             if has_groups > 0 && has_scan_server == 0 {
                 tx.execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
             }
-            commit_migration(tx, 16)?;
+            applied = 16;
+        }
+
+        if version < 17 {
+            info!("Applying database migration v17: NZB content digests for duplicate detection");
+            // Partial schemas (as built by migration tests) may lack either
+            // table, so only the tables that exist gain the column. Existing
+            // rows are backfilled from their stored NZB so they can be matched.
+            for (table, blob_column) in [("queue", "nzb_raw"), ("history", "nzb_data")] {
+                let table_exists: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                if table_exists == 0 {
+                    continue;
+                }
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN nzb_digest TEXT;
+                     CREATE INDEX IF NOT EXISTS idx_{table}_nzb_digest ON {table}(nzb_digest);"
+                ))?;
+                let has_blob: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, blob_column],
+                    |row| row.get(0),
+                )?;
+                if has_blob == 0 {
+                    continue;
+                }
+                let rows: Vec<(String, Vec<u8>)> = {
+                    let mut stmt = tx.prepare(&format!(
+                        "SELECT id, {blob_column} FROM {table} WHERE length({blob_column}) > 0"
+                    ))?;
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                for (id, data) in rows {
+                    tx.execute(
+                        &format!("UPDATE {table} SET nzb_digest = ?2 WHERE id = ?1"),
+                        params![id, nzb_digest(&data)],
+                    )?;
+                }
+            }
+            applied = 17;
+        }
+
+        if version < 18 {
+            info!("Applying database migration v18: history list columns ahead of the NZB blob");
+            // Columns added to history by ALTER TABLE are stored after
+            // nzb_data, so reading them walks the blob's overflow chain (about
+            // 1.3 s for a 50-row page on a production database). List queries
+            // read them from this narrow copy instead; triggers keep it in step.
+            let has_history: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )?;
+            // Partial schemas (as built by migration tests) may lack the
+            // source columns: they still get the table, so list queries work.
+            let source_columns: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('history') WHERE name IN
+                 ('download_time_secs', 'server_stats', 'failure_code',
+                  'post_processing', 'delete_archives')",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS history_list_meta (
+                    id TEXT PRIMARY KEY,
+                    download_time_secs REAL,
+                    server_stats TEXT,
+                    failure_code TEXT,
+                    post_processing INTEGER,
+                    delete_archives INTEGER
+                );",
+            )?;
+            if has_history > 0 && source_columns == 5 {
+                tx.execute_batch(
+                    "INSERT INTO history_list_meta
+                        SELECT id, download_time_secs, server_stats, failure_code,
+                               post_processing, delete_archives FROM history;
+                    CREATE TRIGGER history_list_meta_insert AFTER INSERT ON history BEGIN
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives);
+                    END;
+                    CREATE TRIGGER history_list_meta_update AFTER UPDATE OF
+                        id, download_time_secs, server_stats, failure_code,
+                        post_processing, delete_archives ON history BEGIN
+                        DELETE FROM history_list_meta WHERE id = OLD.id;
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives);
+                    END;
+                    CREATE TRIGGER history_list_meta_delete AFTER DELETE ON history BEGIN
+                        DELETE FROM history_list_meta WHERE id = OLD.id;
+                    END;
+                    CREATE INDEX IF NOT EXISTS idx_history_category ON history(category);",
+                )?;
+            }
+            applied = 18;
+        }
+
+        if version < 19 {
+            info!("Applying database migration v19: PAR2 volumes fetched and available");
+            // Stored in history and copied to history_list_meta, so list
+            // queries read them without walking the NZB blob (v18).
+            let has_history: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_triggers: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND name LIKE 'history_list_meta_%'",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute_batch(
+                "ALTER TABLE history_list_meta ADD COLUMN par2_volumes_fetched INTEGER;
+                 ALTER TABLE history_list_meta ADD COLUMN par2_volumes_available INTEGER;",
+            )?;
+            if has_history > 0 {
+                tx.execute_batch(
+                    "ALTER TABLE history ADD COLUMN par2_volumes_fetched INTEGER;
+                     ALTER TABLE history ADD COLUMN par2_volumes_available INTEGER;",
+                )?;
+            }
+            if has_triggers > 0 {
+                tx.execute_batch(
+                    "DROP TRIGGER history_list_meta_insert;
+                    DROP TRIGGER history_list_meta_update;
+                    CREATE TRIGGER history_list_meta_insert AFTER INSERT ON history BEGIN
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                            NEW.par2_volumes_fetched, NEW.par2_volumes_available);
+                    END;
+                    CREATE TRIGGER history_list_meta_update AFTER UPDATE OF
+                        id, download_time_secs, server_stats, failure_code,
+                        post_processing, delete_archives, par2_volumes_fetched,
+                        par2_volumes_available ON history BEGIN
+                        DELETE FROM history_list_meta WHERE id = OLD.id;
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                            NEW.par2_volumes_fetched, NEW.par2_volumes_available);
+                    END;",
+                )?;
+            }
+            applied = 19;
+        }
+
+        if version < 20 {
+            info!("Applying database migration v20: restorable history deletions");
+            // A history delete the UI offers to undo marks the row instead of
+            // dropping it: `trash = 1` hides it from every history read, and
+            // `trash_deadline` says when it stops being restorable. The row
+            // keeps its NZB and retry blobs, so an undo is lossless; a purge
+            // drops the row and its ledger entries exactly like a hard delete.
+            let has_history: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_history {
+                add_column_if_missing(&tx, "history", "trash", "INTEGER NOT NULL DEFAULT 0")?;
+                add_column_if_missing(&tx, "history", "trash_deadline", "TEXT")?;
+                // `trash` is added after `nzb_data`, so reading it from
+                // `history` walks the blob's overflow chain (v18's reason for
+                // the narrow copy). List queries filter the copy instead.
+                let has_meta: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'history_list_meta'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if has_meta {
+                    add_column_if_missing(&tx, "history_list_meta", "trash", "INTEGER")?;
+                    tx.execute_batch(
+                        "DROP TRIGGER IF EXISTS history_list_meta_insert;
+                        DROP TRIGGER IF EXISTS history_list_meta_update;
+                        DROP TRIGGER IF EXISTS history_list_meta_delete;
+                        CREATE TRIGGER history_list_meta_insert AFTER INSERT ON history BEGIN
+                            INSERT OR REPLACE INTO history_list_meta (
+                                id, download_time_secs, server_stats, failure_code,
+                                post_processing, delete_archives, par2_volumes_fetched,
+                                par2_volumes_available, trash)
+                            VALUES (
+                                NEW.id, NEW.download_time_secs, NEW.server_stats,
+                                NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                                NEW.par2_volumes_fetched, NEW.par2_volumes_available,
+                                NEW.trash);
+                        END;
+                        CREATE TRIGGER history_list_meta_update AFTER UPDATE ON history BEGIN
+                            DELETE FROM history_list_meta WHERE id = OLD.id;
+                            INSERT OR REPLACE INTO history_list_meta (
+                                id, download_time_secs, server_stats, failure_code,
+                                post_processing, delete_archives, par2_volumes_fetched,
+                                par2_volumes_available, trash)
+                            VALUES (
+                                NEW.id, NEW.download_time_secs, NEW.server_stats,
+                                NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                                NEW.par2_volumes_fetched, NEW.par2_volumes_available,
+                                NEW.trash);
+                        END;
+                        CREATE TRIGGER history_list_meta_delete AFTER DELETE ON history BEGIN
+                            DELETE FROM history_list_meta WHERE id = OLD.id;
+                        END;
+                        UPDATE history_list_meta SET trash = COALESCE(
+                            (SELECT trash FROM history h WHERE h.id = history_list_meta.id), 0);",
+                    )?;
+                }
+            }
+            applied = 20;
+        }
+
+        if version < 21 {
+            info!("Applying database migration v21: covering indexes for history aggregates");
+            // The history panel's statistics (completed/failed counts, bytes,
+            // duration and failure reasons) used to load every summary row
+            // just to fold it in Rust, which meant a cold read of the whole
+            // table. `history_window_stats` and `history_failure_messages`
+            // aggregate in SQLite instead, and these indexes let them, the
+            // category list and the paged count run without opening the table
+            // or walking any row's stored NZB blob.
+            //
+            // `idx_h_stats_cover` also serves the page and its count; the
+            // partial `idx_h_fail_cover` carries only the failed rows' error
+            // text. Its predicate must spell `COLLATE NOCASE`, because the
+            // query compares status case-insensitively and SQLite only uses a
+            // partial index whose term matches the query's collation.
+            //
+            // `idx_meta_trash` matters most: the anti-join that hides trashed
+            // rows probes `history_list_meta(trash, id)` on every stats,
+            // category and count query, and without it each probe walks the
+            // meta table.
+            //
+            // Each index is created only when its table and columns exist:
+            // migration tests build partial schemas to exercise older steps,
+            // and those must still reach the newest schema version.
+            create_index_if_columns(
+                &tx,
+                "history",
+                &["completed_at", "status", "total_bytes", "added_at", "id"],
+                "CREATE INDEX IF NOT EXISTS idx_h_stats_cover
+                    ON history(completed_at DESC, status, total_bytes, added_at, id);",
+            )?;
+            create_index_if_columns(
+                &tx,
+                "history",
+                &["category", "id"],
+                "CREATE INDEX IF NOT EXISTS idx_h_cat_cover ON history(category, id);",
+            )?;
+            create_index_if_columns(
+                &tx,
+                "history_list_meta",
+                &["trash", "id"],
+                "CREATE INDEX IF NOT EXISTS idx_meta_trash ON history_list_meta(trash, id);",
+            )?;
+            create_index_if_columns(
+                &tx,
+                "history",
+                &["completed_at", "error_message", "id", "status"],
+                "CREATE INDEX IF NOT EXISTS idx_h_fail_cover
+                    ON history(completed_at DESC, error_message, id)
+                    WHERE status = 'Failed' COLLATE NOCASE;",
+            )?;
+            applied = 21;
+        }
+
+        if version < 22 {
+            info!("Applying database migration v22: indexed duplicate lookup by name");
+            // The duplicate check on every add matches names ignoring case.
+            // Without an index on LOWER(name) it scanned the whole history
+            // table, whose rows carry their NZB blob inline: on a 2.3 GB
+            // database that took 18 s under the global DB lock and froze the
+            // GUI. These expression indexes (with the v17 digest indexes) let
+            // each branch of the lookup seek instead.
+            for table in ["queue", "history"] {
+                create_index_if_columns(
+                    &tx,
+                    table,
+                    &["name"],
+                    &format!(
+                        "CREATE INDEX IF NOT EXISTS idx_{table}_name_lower ON {table}(LOWER(name));"
+                    ),
+                )?;
+            }
+            applied = 22;
+        }
+
+        if version < 23 {
+            info!("Applying database migration v23: history rows kept after an *arr delete");
+            // An *arr "Remove Completed" deletes the job's files through the
+            // SABnzbd API but leaves rustnzb's own History row in place. The
+            // marker lives in its own narrow table, so list reads join it
+            // without touching columns stored after the NZB blob, and the
+            // SABnzbd history the *arrs poll can skip the marked rows.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS history_client_removals (
+                    id TEXT PRIMARY KEY,
+                    removed_by TEXT NOT NULL,
+                    removed_at TEXT NOT NULL,
+                    files_deleted INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            let has_history: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_history {
+                tx.execute_batch(
+                    "CREATE TRIGGER IF NOT EXISTS history_client_removals_delete
+                        AFTER DELETE ON history BEGIN
+                        DELETE FROM history_client_removals WHERE id = OLD.id;
+                    END;",
+                )?;
+            }
+            applied = 23;
+        }
+
+        if applied > version {
+            stamp_schema_version(&tx, applied)?;
+            tx.commit()?;
+            info!(version = applied, "Database schema up to date");
         }
 
         Ok(())
@@ -554,9 +904,9 @@ impl Database {
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
              articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
-             nzb_raw, pp_override, delete_archives)
+             nzb_raw, pp_override, delete_archives, nzb_digest)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-             ?16, ?17, ?18, ?19)",
+             ?16, ?17, ?18, ?19, ?20)",
             params![
                 job.id,
                 job.name,
@@ -577,6 +927,7 @@ impl Database {
                 nzb_data,
                 job.pp_override,
                 job.delete_archives,
+                nzb_digest(nzb_data),
             ],
         )?;
 
@@ -737,6 +1088,41 @@ impl Database {
         Ok(())
     }
 
+    /// Update a job's progress counters without touching its status, for the
+    /// periodic progress save: status is written separately, from the job
+    /// list's current value, so a stale snapshot never overwrites a pause or
+    /// resume.
+    pub fn queue_update_counters(
+        &self,
+        id: &str,
+        downloaded_bytes: u64,
+        articles_downloaded: usize,
+        articles_failed: usize,
+        files_completed: usize,
+    ) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET downloaded_bytes=?2, articles_downloaded=?3,
+             articles_failed=?4, files_completed=?5 WHERE id=?1",
+            params![
+                id,
+                downloaded_bytes as i64,
+                articles_downloaded as i64,
+                articles_failed as i64,
+                files_completed as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update only a queued job's status.
+    pub fn queue_update_status(&self, id: &str, status: JobStatus) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET status=?2 WHERE id=?1",
+            params![id, status.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Update the non-terminal, user-visible queue message for a job.
     pub fn queue_update_error_message(
         &self,
@@ -779,6 +1165,8 @@ impl Database {
         let jobs = stmt
             .query_map([], |row| {
                 Ok(NzbJob {
+                    slice_map: None,
+                    held_par2_bytes: 0,
                     id: row.get(0)?,
                     name: row.get(1)?,
                     category: row.get(2)?,
@@ -815,6 +1203,37 @@ impl Database {
     // History operations
     // -----------------------------------------------------------------------
 
+    /// Find queued and history jobs that an incoming NZB matches by name
+    /// (ignoring ASCII case) or, when `digest` is given, by content digest.
+    /// Only a history job that completed successfully matches; failed and
+    /// deleted (trashed) history jobs never do. An arr re-grabbing a release
+    /// whose earlier attempt failed or was removed is therefore admitted as a
+    /// new job, and the old Failed history row is kept next to it (it is not
+    /// replaced). Queued jobs always match.
+    pub fn find_duplicate_candidates(
+        &self,
+        name: &str,
+        digest: Option<&str>,
+    ) -> Result<Vec<DuplicateMatch>, NzbError> {
+        let mut stmt = self.conn.prepare(DUPLICATE_CANDIDATES_SQL)?;
+        let matches = stmt
+            .query_map(params![name, digest], |row| {
+                let location = match row.get::<_, String>(4)?.as_str() {
+                    "queue" => DuplicateLocation::Queue,
+                    _ => DuplicateLocation::History,
+                };
+                Ok(DuplicateMatch {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    by_name: row.get::<_, i64>(2)? != 0,
+                    by_digest: row.get::<_, i64>(3)? != 0,
+                    location,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(matches)
+    }
+
     /// Move a completed/failed job to history.
     pub fn history_insert(&self, entry: &HistoryEntry) -> Result<(), NzbError> {
         self.history_insert_with_carried_bytes(entry, 0)
@@ -844,9 +1263,10 @@ impl Database {
         tx.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message,
-             nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives)
+             nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives,
+             nzb_digest, par2_volumes_fetched, par2_volumes_available)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17, ?18)",
+             ?17, ?18, ?19, ?20, ?21)",
             params![
                 entry.id,
                 entry.name,
@@ -866,6 +1286,9 @@ impl Database {
                 entry.failure_code.map(|code| code.to_string()),
                 entry.post_processing,
                 entry.delete_archives,
+                entry.nzb_data.as_deref().map(nzb_digest),
+                entry.par2_volumes_fetched,
+                entry.par2_volumes_available,
             ],
         )?;
 
@@ -929,25 +1352,89 @@ impl Database {
 
     /// List history entries, most recent first.
     pub fn history_list(&self, limit: usize) -> Result<Vec<HistoryEntry>, NzbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code,
-             post_processing, delete_archives
-             FROM history ORDER BY completed_at DESC LIMIT ?1",
-        )?;
-
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}
+             WHERE COALESCE(m.trash, 0) = 0 ORDER BY h.completed_at DESC LIMIT ?1"
+        ))?;
         let entries = stmt
-            .query_map(params![limit as i64], |row| {
-                let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
-                let stages: Vec<StageResult> =
-                    serde_json::from_str(&stages_json).unwrap_or_default();
-                let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
-                let server_stats: Vec<ServerArticleStats> =
-                    serde_json::from_str(&stats_json).unwrap_or_default();
-                let has_nzb: i64 = row.get(13)?;
+            .query_map(params![limit as i64], history_list_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
 
-                Ok(HistoryEntry {
+    /// One page of history matching `filter`, most recent first, plus the
+    /// total number of matching rows. Filtering, ordering and paging all run
+    /// in SQL, and the stored NZB and retry blobs are never read.
+    pub fn history_page(
+        &self,
+        filter: &HistoryFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<HistoryEntry>, usize), NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        // Count with an anti-join, not the page's `LEFT JOIN`: the page still
+        // needs the meta columns, but the count only needs to know that no
+        // trashed row matched, and the anti-join lets it run entirely on the
+        // covering indexes.
+        let total: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM history h{}",
+                with_condition(
+                    &where_sql,
+                    "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+                )
+            ),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get(0),
+        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&history_page_sql(&where_sql, args.len()))?;
+        let mut page_args = args;
+        page_args.push(Box::new(limit.min(i64::MAX as usize) as i64));
+        page_args.push(Box::new(offset.min(i64::MAX as usize) as i64));
+        let entries = stmt
+            .query_map(
+                rusqlite::params_from_iter(page_args.iter()),
+                history_list_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((entries, total as usize))
+    }
+
+    /// Distinct non-empty history categories, sorted.
+    ///
+    /// Trashed rows are excluded with an anti-join rather than the list
+    /// query's `LEFT JOIN` + `COALESCE(m.trash, 0) = 0`: the subquery only
+    /// ever yields rows whose `trash` is 1, so its ids are never NULL and
+    /// `NOT IN` and the `COALESCE` test select the same rows. Either way the
+    /// plan can read `idx_h_cat_cover` and probe `idx_meta_trash` without
+    /// opening the `history` table.
+    pub fn history_categories(&self) -> Result<Vec<String>, NzbError> {
+        let mut stmt = self.conn.prepare(&history_categories_sql())?;
+        let categories = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(categories)
+    }
+
+    /// Lightweight view of every history row matching `filter`, most recent
+    /// first. Only the columns stored ahead of the NZB blob are read, so this
+    /// stays cheap however large the stored NZBs are.
+    pub fn history_summaries(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<HistorySummary>, NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT h.id, h.name, h.category, h.status, h.total_bytes, h.downloaded_bytes,
+             h.added_at, h.completed_at, h.output_dir, h.error_message
+             FROM {HISTORY_LIST_FROM}{} ORDER BY h.completed_at DESC",
+            with_condition(&where_sql, "COALESCE(m.trash, 0) = 0")
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(HistorySummary {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     category: row.get(2)?,
@@ -956,21 +1443,74 @@ impl Database {
                     downloaded_bytes: row.get::<_, i64>(5)? as u64,
                     added_at: parse_datetime(&row.get::<_, String>(6)?),
                     completed_at: parse_datetime(&row.get::<_, String>(7)?),
-                    download_time_secs: row.get(8)?,
-                    output_dir: row.get::<_, String>(9)?.into(),
-                    stages,
-                    error_message: row.get(11)?,
-                    failure_code: parse_failure_code(row.get(14)?)?,
-                    post_processing: row.get(15)?,
-                    delete_archives: row.get(16)?,
-                    server_stats,
-                    // Don't load actual blob in list - just note if it exists
-                    nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
-                    retry_data: None,
+                    output_dir: row.get::<_, String>(8)?.into(),
+                    error_message: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 
+    /// Completed/failed counts, completed bytes and completed duration over
+    /// every history row matching `filter`.
+    ///
+    /// The history panel's statistics used to be folded in Rust from
+    /// [`Self::history_summaries`], which reads a summary row (including its
+    /// error text) for every entry in the window. The same fold runs here as
+    /// one aggregate over `idx_h_stats_cover`, so a cold panel load touches a
+    /// narrow index instead of the table.
+    pub fn history_window_stats(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<HistoryWindowStats, NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let sql = history_window_stats_sql(&where_sql);
+        let stats = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(HistoryWindowStats {
+                    completed: row.get::<_, i64>(0)? as u64,
+                    completed_bytes: row.get::<_, i64>(1)? as u64,
+                    completed_duration_ms: row.get(2)?,
+                    failed: row.get::<_, i64>(3)? as u64,
+                })
+            })?;
+        Ok(stats)
+    }
+
+    /// Error text of every failed row matching `filter`, most recent first.
+    ///
+    /// Only the failure reasons need the text, so this reads the partial
+    /// `idx_h_fail_cover` index instead of the summary columns. The index is
+    /// named explicitly because the planner would otherwise prefer the
+    /// completed-at index when a days window narrows the scan, and then walk
+    /// the table for each row's error message.
+    pub fn history_failure_messages(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<Option<String>>, NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let sql = history_failure_messages_sql(&where_sql);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let messages = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    /// List-shaped history entries for `ids`, in the order given. Unknown ids
+    /// are skipped. Like [`Database::history_list`], blobs are not loaded.
+    pub fn history_get_listed(&self, ids: &[String]) -> Result<Vec<HistoryEntry>, NzbError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}
+             WHERE h.id = ?1 AND COALESCE(m.trash, 0) = 0"
+        ))?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = stmt.query_row(params![id], history_list_row).optional()? {
+                entries.push(entry);
+            }
+        }
         Ok(entries)
     }
 
@@ -1002,32 +1542,183 @@ impl Database {
         }
     }
 
-    /// Enforce history retention limit by deleting oldest entries.
+    /// Enforce history retention limit by deleting oldest entries, and the
+    /// ledger rows of jobs now gone.
     ///
     /// A limit of `0` is treated as "keep all" and is a no-op: the
     /// `LIMIT 0` subquery would otherwise match nothing and delete every
     /// row (GH #136). Callers normalize zero away already; this is the last
     /// line of defence.
+    ///
+    /// Trashed entries are not part of the limit: they are already gone from
+    /// the user's view, and retention must not silently consume an undo
+    /// window that the purge deadline owns.
     pub fn history_enforce_retention(&self, max_entries: usize) -> Result<(), NzbError> {
         if max_entries == 0 {
             return Ok(());
         }
         self.conn.execute(
-            "DELETE FROM history WHERE id NOT IN (
-                SELECT id FROM history ORDER BY completed_at DESC LIMIT ?1
+            "DELETE FROM history WHERE trash = 0 AND id NOT IN (
+                SELECT id FROM history WHERE trash = 0
+                ORDER BY completed_at DESC LIMIT ?1
             )",
             params![max_entries as i64],
         )?;
+        self.ledger_drop_orphans()?;
         Ok(())
+    }
+
+    /// Move history rows into the undo window instead of deleting them.
+    ///
+    /// Each row keeps its NZB and retry blobs, so [`Self::history_restore`] is
+    /// lossless. Returns the summaries of the rows actually trashed, in the
+    /// order given; an id that is unknown or already trashed is skipped, since
+    /// the caller reports that as a per-id failure.
+    pub fn history_trash(
+        &self,
+        ids: &[String],
+        deadline: chrono::DateTime<Utc>,
+    ) -> Result<Vec<HistorySummary>, NzbError> {
+        let mut trashed = Vec::with_capacity(ids.len());
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            let changed = tx.execute(
+                "UPDATE history SET trash = 1, trash_deadline = ?2
+                 WHERE id = ?1 AND trash = 0",
+                params![id, deadline.to_rfc3339()],
+            )?;
+            if changed == 0 {
+                continue;
+            }
+            if let Some(summary) = history_summary_by_id(&tx, id)? {
+                trashed.push(summary);
+            }
+        }
+        tx.commit()?;
+        Ok(trashed)
+    }
+
+    /// Bring trashed rows back before their deadline. Returns the ids that
+    /// were restored, in the order given; an unknown id, or one whose window
+    /// has closed, is skipped.
+    pub fn history_restore(
+        &self,
+        ids: &[String],
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<String>, NzbError> {
+        let mut restored = Vec::with_capacity(ids.len());
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            let changed = tx.execute(
+                "UPDATE history SET trash = 0, trash_deadline = NULL
+                 WHERE id = ?1 AND trash = 1
+                   AND (trash_deadline IS NULL OR trash_deadline >= ?2)",
+                params![id, now.to_rfc3339()],
+            )?;
+            if changed > 0 {
+                restored.push(id.clone());
+            }
+        }
+        tx.commit()?;
+        Ok(restored)
+    }
+
+    /// Delete every trashed row whose deadline has passed, and the ledger rows
+    /// of those jobs. Returns the summaries that were purged so the caller can
+    /// reclaim their retained work directories.
+    pub fn history_purge_expired(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<HistorySummary>, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut purged = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+                 completed_at, output_dir, error_message
+                 FROM history
+                 WHERE trash = 1 AND (trash_deadline IS NULL OR trash_deadline < ?1)",
+            )?;
+            let rows = stmt.query_map(params![now.to_rfc3339()], |row| {
+                Ok(HistorySummary {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    category: row.get(2)?,
+                    status: parse_status(&row.get::<_, String>(3)?),
+                    total_bytes: row.get::<_, i64>(4)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(5)? as u64,
+                    added_at: parse_datetime(&row.get::<_, String>(6)?),
+                    completed_at: parse_datetime(&row.get::<_, String>(7)?),
+                    output_dir: row.get::<_, String>(8)?.into(),
+                    error_message: row.get(9)?,
+                })
+            })?;
+            for row in rows {
+                purged.push(row?);
+            }
+        }
+        tx.execute(
+            "DELETE FROM history
+             WHERE trash = 1 AND (trash_deadline IS NULL OR trash_deadline < ?1)",
+            params![now.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        self.ledger_drop_orphans()?;
+        Ok(purged)
+    }
+
+    /// Every trashed row, regardless of deadline. Used to keep a trashed
+    /// row's retained work directories out of the orphan sweep while its
+    /// undo window is open.
+    pub fn history_trashed_summaries(&self) -> Result<Vec<HistorySummary>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+             completed_at, output_dir, error_message
+             FROM history WHERE trash = 1",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(HistorySummary {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    category: row.get(2)?,
+                    status: parse_status(&row.get::<_, String>(3)?),
+                    total_bytes: row.get::<_, i64>(4)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(5)? as u64,
+                    added_at: parse_datetime(&row.get::<_, String>(6)?),
+                    completed_at: parse_datetime(&row.get::<_, String>(7)?),
+                    output_dir: row.get::<_, String>(8)?.into(),
+                    error_message: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Ids of every trashed row, regardless of deadline. Used to keep their
+    /// retained work directories out of the orphan sweep while an undo is
+    /// still possible.
+    pub fn history_trashed_ids(&self) -> Result<Vec<String>, NzbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM history WHERE trash = 1")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
     }
 
     /// Get a single history entry by ID.
     pub fn history_get(&self, id: &str) -> Result<Option<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             failure_code, post_processing, delete_archives
-             FROM history WHERE id = ?1",
+            "SELECT h.id, h.name, h.category, h.status, h.total_bytes, h.downloaded_bytes,
+             h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
+             h.error_message, m.server_stats, m.failure_code, m.post_processing, m.delete_archives,
+             m.par2_volumes_fetched, m.par2_volumes_available,
+             r.removed_by, r.removed_at, r.files_deleted
+             FROM history h LEFT JOIN history_list_meta m ON m.id = h.id
+             LEFT JOIN history_client_removals r ON r.id = h.id
+             WHERE h.id = ?1 AND COALESCE(m.trash, 0) = 0",
         )?;
 
         let result = stmt.query_row(params![id], |row| {
@@ -1056,6 +1747,9 @@ impl Database {
                 server_stats,
                 nzb_data: None,
                 retry_data: None,
+                par2_volumes_fetched: row.get(16)?,
+                par2_volumes_available: row.get(17)?,
+                client_removal: client_removal_at(row, 18)?,
             })
         });
 
@@ -1087,8 +1781,8 @@ impl Database {
     /// Store raw NZB data for a queue job.
     pub fn queue_store_nzb_data(&self, id: &str, nzb_data: &[u8]) -> Result<(), NzbError> {
         self.conn.execute(
-            "UPDATE queue SET nzb_raw = ?2 WHERE id = ?1",
-            params![id, nzb_data],
+            "UPDATE queue SET nzb_raw = ?2, nzb_digest = ?3 WHERE id = ?1",
+            params![id, nzb_data, nzb_digest(nzb_data)],
         )?;
         Ok(())
     }
@@ -1109,22 +1803,63 @@ impl Database {
 
     /// Count history entries.
     pub fn history_count(&self) -> Result<usize, NzbError> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+        let count: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {HISTORY_LIST_FROM} WHERE COALESCE(m.trash, 0) = 0"),
+            [],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
-    /// Remove a history entry.
+    /// Mark history rows as removed by an external client (an *arr through
+    /// the SABnzbd API) instead of deleting them. Returns how many rows were
+    /// marked; an unknown id is skipped.
+    pub fn history_mark_client_removed(
+        &self,
+        ids: &[String],
+        removed_by: &str,
+        removed_at: chrono::DateTime<Utc>,
+        files_deleted: bool,
+    ) -> Result<usize, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut marked = 0;
+        for id in ids {
+            marked += tx.execute(
+                "INSERT OR REPLACE INTO history_client_removals
+                    (id, removed_by, removed_at, files_deleted)
+                 SELECT id, ?2, ?3, ?4 FROM history WHERE id = ?1",
+                params![id, removed_by, removed_at.to_rfc3339(), files_deleted],
+            )?;
+        }
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    /// Ids of every history row an external client has removed.
+    pub fn history_client_removed_ids(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, NzbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM history_client_removals")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Remove a history entry, and the ledger rows of a job now gone.
     pub fn history_remove(&self, id: &str) -> Result<(), NzbError> {
         self.conn
             .execute("DELETE FROM history WHERE id=?1", params![id])?;
+        self.ledger_drop_orphans()?;
         Ok(())
     }
 
-    /// Clear all history.
+    /// Clear all history, and the ledger rows of jobs now gone.
     pub fn history_clear(&self) -> Result<(), NzbError> {
         self.conn.execute("DELETE FROM history", [])?;
+        self.ledger_drop_orphans()?;
         Ok(())
     }
 
@@ -1406,6 +2141,256 @@ impl Database {
 // Parse helpers
 // ---------------------------------------------------------------------------
 
+/// Columns of a history list row, selected `FROM` [`HISTORY_LIST_FROM`].
+/// `has_nzb` uses `typeof()`, which SQLite answers from the record header
+/// without loading the blob itself. Columns stored after `nzb_data` in
+/// `history` come from `history_list_meta`, so no blob overflow chain is
+/// walked for a list row.
+const HISTORY_LIST_COLUMNS: &str = "h.id, h.name, h.category, h.status, h.total_bytes,
+     h.downloaded_bytes, h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
+     h.error_message, m.server_stats, typeof(h.nzb_data) <> 'null' AS has_nzb, m.failure_code,
+     m.post_processing, m.delete_archives, m.par2_volumes_fetched, m.par2_volumes_available,
+     r.removed_by, r.removed_at, r.files_deleted";
+
+/// Duplicate lookup for `find_duplicate_candidates`. Name and digest
+/// matches are separate SELECTs joined by UNION (which also removes a row
+/// matched both ways) so each one seeks its own index —
+/// `idx_*_name_lower` or `idx_*_nzb_digest` — rather than SQLite falling
+/// back to a full scan for the OR. Only matching rows are ever read.
+const DUPLICATE_CANDIDATES_SQL: &str = "
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'queue'
+    FROM queue WHERE LOWER(name) = LOWER(?1)
+    UNION
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'queue'
+    FROM queue WHERE nzb_digest = ?2
+    UNION
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
+    FROM history WHERE LOWER(name) = LOWER(?1) AND trash = 0
+        AND status = 'Completed' COLLATE NOCASE
+    UNION
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
+    FROM history WHERE nzb_digest = ?2 AND trash = 0
+        AND status = 'Completed' COLLATE NOCASE";
+
+/// Source of [`HISTORY_LIST_COLUMNS`].
+const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id
+     LEFT JOIN history_client_removals r ON r.id = h.id";
+
+/// Append `condition` to a filter's ` WHERE ...` clause (or start one).
+fn with_condition(where_sql: &str, condition: &str) -> String {
+    match where_sql.strip_prefix(" WHERE ") {
+        Some(rest) => format!(" WHERE {condition} AND {rest}"),
+        None => format!(" WHERE {condition}"),
+    }
+}
+
+fn history_page_sql(where_sql: &str, arg_count: usize) -> String {
+    // `trash = 0` is part of the page, not the caller's filter, so a paged
+    // request can never see a row that is inside its undo window.
+    format!(
+        "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}{}
+         ORDER BY h.completed_at DESC LIMIT ?{} OFFSET ?{}",
+        with_condition(where_sql, "COALESCE(m.trash, 0) = 0"),
+        arg_count + 1,
+        arg_count + 2
+    )
+}
+
+/// One [`HistorySummary`] by id, read inside an open transaction.
+fn history_summary_by_id(conn: &Connection, id: &str) -> Result<Option<HistorySummary>, NzbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+         completed_at, output_dir, error_message
+         FROM history WHERE id = ?1",
+    )?;
+    Ok(stmt
+        .query_row(params![id], |row| {
+            Ok(HistorySummary {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                category: row.get(2)?,
+                status: parse_status(&row.get::<_, String>(3)?),
+                total_bytes: row.get::<_, i64>(4)? as u64,
+                downloaded_bytes: row.get::<_, i64>(5)? as u64,
+                added_at: parse_datetime(&row.get::<_, String>(6)?),
+                completed_at: parse_datetime(&row.get::<_, String>(7)?),
+                output_dir: row.get::<_, String>(8)?.into(),
+                error_message: row.get(9)?,
+            })
+        })
+        .optional()?)
+}
+
+fn history_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
+    let stages: Vec<StageResult> = serde_json::from_str(&stages_json).unwrap_or_default();
+    let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+    let server_stats: Vec<ServerArticleStats> =
+        serde_json::from_str(&stats_json).unwrap_or_default();
+    let has_nzb: bool = row.get(13)?;
+
+    Ok(HistoryEntry {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        category: row.get(2)?,
+        status: parse_status(&row.get::<_, String>(3)?),
+        total_bytes: row.get::<_, i64>(4)? as u64,
+        downloaded_bytes: row.get::<_, i64>(5)? as u64,
+        added_at: parse_datetime(&row.get::<_, String>(6)?),
+        completed_at: parse_datetime(&row.get::<_, String>(7)?),
+        download_time_secs: row.get(8)?,
+        output_dir: row.get::<_, String>(9)?.into(),
+        stages,
+        error_message: row.get(11)?,
+        failure_code: parse_failure_code(row.get(14)?)?,
+        post_processing: row.get(15)?,
+        delete_archives: row.get(16)?,
+        server_stats,
+        // Don't load actual blob in list - just note if it exists
+        nzb_data: if has_nzb { Some(Vec::new()) } else { None },
+        retry_data: None,
+        par2_volumes_fetched: row.get(17)?,
+        par2_volumes_available: row.get(18)?,
+        client_removal: client_removal_at(row, 19)?,
+    })
+}
+
+/// The [`HistoryClientRemoval`] read from `removed_by`, `removed_at` and
+/// `files_deleted`, starting at column `first`.
+fn client_removal_at(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+) -> rusqlite::Result<Option<HistoryClientRemoval>> {
+    let Some(removed_by) = row.get::<_, Option<String>>(first)? else {
+        return Ok(None);
+    };
+    Ok(Some(HistoryClientRemoval {
+        removed_by,
+        removed_at: parse_datetime(&row.get::<_, String>(first + 1)?),
+        files_deleted: row.get(first + 2)?,
+    }))
+}
+
+/// SQL-side history filter. Every set field narrows the match.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryFilter {
+    /// Only rows completed at or after this instant.
+    pub completed_since: Option<chrono::DateTime<Utc>>,
+    /// Exact status, compared case-insensitively.
+    pub status: Option<JobStatus>,
+    /// Exact category.
+    pub category: Option<String>,
+    /// Case-insensitive substring of the name.
+    pub search: Option<String>,
+}
+
+impl HistoryFilter {
+    fn to_sql(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = self.completed_since {
+            args.push(Box::new(since.to_rfc3339()));
+            clauses.push(format!("completed_at >= ?{}", args.len()));
+        }
+        if let Some(status) = self.status {
+            args.push(Box::new(status.to_string()));
+            clauses.push(format!("status = ?{} COLLATE NOCASE", args.len()));
+        }
+        if let Some(category) = &self.category {
+            args.push(Box::new(category.clone()));
+            clauses.push(format!("category = ?{}", args.len()));
+        }
+        if let Some(search) = &self.search {
+            args.push(Box::new(search.to_lowercase()));
+            clauses.push(format!("instr(lower(name), ?{}) > 0", args.len()));
+        }
+        if clauses.is_empty() {
+            (String::new(), args)
+        } else {
+            (format!(" WHERE {}", clauses.join(" AND ")), args)
+        }
+    }
+}
+
+/// The history columns stored ahead of the NZB blob: enough to filter,
+/// count, total and delete without touching the blob's overflow pages.
+#[derive(Debug, Clone)]
+pub struct HistorySummary {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub status: JobStatus,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub added_at: chrono::DateTime<Utc>,
+    pub completed_at: chrono::DateTime<Utc>,
+    pub output_dir: std::path::PathBuf,
+    pub error_message: Option<String>,
+}
+
+/// The aggregate half of the history panel's statistics: completed count,
+/// completed bytes, completed duration and failed count.
+///
+/// Kept beside [`HISTORY_LIST_FROM`]'s query helpers so the query-plan test
+/// asserts on the SQL the endpoint actually runs.
+fn history_window_stats_sql(where_sql: &str) -> String {
+    format!(
+        "SELECT
+            COALESCE(SUM(CASE WHEN h.status = 'Completed' COLLATE NOCASE
+                              THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN h.status = 'Completed' COLLATE NOCASE
+                              THEN h.total_bytes ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN h.status = 'Completed' COLLATE NOCASE
+                              THEN CAST(ROUND((julianday(h.completed_at)
+                                               - julianday(h.added_at)) * 86400000.0)
+                                        AS INTEGER)
+                              ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN h.status = 'Failed' COLLATE NOCASE
+                              THEN 1 ELSE 0 END), 0)
+         FROM history h{}",
+        with_condition(
+            where_sql,
+            "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+        )
+    )
+}
+
+/// Error text of the failed rows matching the same filter, newest first.
+fn history_failure_messages_sql(where_sql: &str) -> String {
+    format!(
+        "SELECT h.error_message FROM history h INDEXED BY idx_h_fail_cover{}
+         ORDER BY h.completed_at DESC",
+        with_condition(
+            &with_condition(where_sql, "h.status = 'Failed' COLLATE NOCASE"),
+            "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+        )
+    )
+}
+
+/// The distinct non-empty categories of the untrashed rows, in name order.
+fn history_categories_sql() -> String {
+    "SELECT DISTINCT h.category FROM history h
+     WHERE h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)
+       AND h.category <> ''
+     ORDER BY h.category"
+        .to_string()
+}
+
+/// The history panel's aggregates over a time window, computed in SQL.
+///
+/// `completed_duration_ms` is the sum of each completed row's
+/// `(completed_at - added_at)` in whole milliseconds. SQLite derives it from
+/// `julianday`, whose double precision is finer than a millisecond, and rounds
+/// to the nearest one, so the totals match the Rust fold's `num_milliseconds()`
+/// except where a row's duration has a sub-millisecond remainder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryWindowStats {
+    pub completed: u64,
+    pub completed_bytes: u64,
+    pub completed_duration_ms: i64,
+    pub failed: u64,
+}
+
 fn parse_status(s: &str) -> JobStatus {
     match s.to_lowercase().as_str() {
         "queued" => JobStatus::Queued,
@@ -1455,11 +2440,12 @@ fn parse_datetime(s: &str) -> chrono::DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
-fn commit_migration(tx: rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
+/// Record the schema version a batch of migrations reached. The caller owns
+/// the transaction and commits it once, after the last migration.
+fn stamp_schema_version(tx: &rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
     tx.execute_batch(&format!(
         "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES ({version});"
     ))?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -1487,12 +2473,43 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// Run `definition` to create an index only when `table` exists and carries
+/// every column it indexes.
+///
+/// Migration tests build partial schemas to reach an older version, so a
+/// later step must not assume the full table shape. An index over a column a
+/// partial schema lacks is skipped, exactly as `add_column_if_missing` would
+/// leave the column absent.
+fn create_index_if_columns(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    columns: &[&str],
+    definition: &str,
+) -> Result<(), NzbError> {
+    for column in columns {
+        let exists: bool = tx
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+                [table, column],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(());
+        }
+    }
+    tx.execute_batch(definition)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_job(id: &str, name: &str) -> NzbJob {
         NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: name.into(),
             category: "Default".into(),
@@ -1568,6 +2585,7 @@ mod tests {
 
     fn make_history(id: &str, name: &str) -> HistoryEntry {
         HistoryEntry {
+            client_removal: None,
             id: id.into(),
             name: name.into(),
             category: "movies".into(),
@@ -1591,7 +2609,123 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         }
+    }
+
+    #[test]
+    fn duplicate_candidates_match_queue_and_history_by_name_or_digest() {
+        let db = Database::open_memory().unwrap();
+        let payload = b"<nzb>queued</nzb>";
+        let digest = nzb_digest(payload);
+
+        let queued = make_job("queued-job", "Show.S01E01");
+        db.queue_insert(&queued).unwrap();
+        db.queue_store_nzb_data(&queued.id, payload).unwrap();
+
+        let mut finished = make_history("done-job", "Other.Release");
+        finished.nzb_data = Some(b"<nzb>finished</nzb>".to_vec());
+        db.history_insert(&finished).unwrap();
+
+        // Name match is case-insensitive and reports the queue row.
+        let by_name = db
+            .find_duplicate_candidates("show.s01e01", Some(&nzb_digest(b"unrelated")))
+            .unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].id, "queued-job");
+        assert_eq!(by_name[0].location, DuplicateLocation::Queue);
+        assert!(by_name[0].by_name && !by_name[0].by_digest);
+
+        // Digest match finds a history row under a different name.
+        let by_digest = db
+            .find_duplicate_candidates("Renamed.Upload", Some(&nzb_digest(b"<nzb>finished</nzb>")))
+            .unwrap();
+        assert_eq!(by_digest.len(), 1);
+        assert_eq!(by_digest[0].id, "done-job");
+        assert_eq!(by_digest[0].location, DuplicateLocation::History);
+        assert!(!by_digest[0].by_name && by_digest[0].by_digest);
+
+        // The queued payload's digest also matches the queue row by content.
+        let both = db
+            .find_duplicate_candidates("Show.S01E01", Some(&digest))
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert!(both[0].by_name && both[0].by_digest);
+
+        assert!(
+            db.find_duplicate_candidates("Nothing.Here", Some(&nzb_digest(b"new")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_seek_indexes_not_scan() {
+        let db = Database::open_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {DUPLICATE_CANDIDATES_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["x", "sha256:y"], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for index in [
+            "idx_queue_name_lower",
+            "idx_queue_nzb_digest",
+            "idx_history_name_lower",
+            "idx_history_nzb_digest",
+        ] {
+            assert!(
+                plan.iter().any(|step| step.contains(index)),
+                "{index} unused: {plan:?}"
+            );
+        }
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.starts_with("SCAN queue") || step.starts_with("SCAN history")),
+            "duplicate lookup scans a table: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_lookup_stays_fast_with_large_history() {
+        // A file database, like production: 2,000 history rows each carrying
+        // a 256 KiB NZB blob inline (~500 MB). The lookup must not read them.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("dup.db")).unwrap();
+        let blob = vec![b'x'; 256 * 1024];
+        db.conn.execute_batch("PRAGMA synchronous = OFF;").unwrap();
+        for i in 0..2000 {
+            let mut entry = make_history(&format!("h{i}"), &format!("Release.{i}"));
+            let mut data = blob.clone();
+            data.extend_from_slice(i.to_string().as_bytes());
+            entry.nzb_data = Some(data);
+            db.history_insert(&entry).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let found = db
+            .find_duplicate_candidates("release.1999", Some(&nzb_digest(b"new")))
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "h1999");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "duplicate lookup took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn nzb_digest_is_sha256_hex_with_prefix() {
+        assert_eq!(
+            nzb_digest(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     fn make_rss_item(id: &str, feed: &str, title: &str) -> RssItem {
@@ -1734,6 +2868,34 @@ mod tests {
         let listed = db.history_list(10).unwrap();
         let level = listed.iter().find(|entry| entry.id == "pp-level").unwrap();
         assert_eq!(level.post_processing, Some(1));
+    }
+
+    #[test]
+    fn history_round_trips_par2_volume_counts() {
+        let db = Database::open_memory().unwrap();
+        let mut stored = make_history("par2-vols", "Vols");
+        stored.par2_volumes_fetched = Some(2);
+        stored.par2_volumes_available = Some(5);
+        db.history_insert(&stored).unwrap();
+        db.history_insert(&make_history("par2-legacy", "Legacy"))
+            .unwrap();
+
+        let got = db.history_get("par2-vols").unwrap().unwrap();
+        assert_eq!(
+            (got.par2_volumes_fetched, got.par2_volumes_available),
+            (Some(2), Some(5))
+        );
+        let listed = db.history_list(10).unwrap();
+        let vols = listed.iter().find(|entry| entry.id == "par2-vols").unwrap();
+        assert_eq!(
+            (vols.par2_volumes_fetched, vols.par2_volumes_available),
+            (Some(2), Some(5))
+        );
+        let legacy = listed
+            .iter()
+            .find(|entry| entry.id == "par2-legacy")
+            .unwrap();
+        assert_eq!(legacy.par2_volumes_available, None);
     }
 
     #[test]
@@ -2132,6 +3294,207 @@ mod tests {
         );
     }
 
+    /// A trashed row disappears from every history read, keeps its blobs for
+    /// the undo, and comes back unchanged when it is restored.
+    #[test]
+    fn history_trash_hides_the_row_and_restore_brings_it_back() {
+        let db = Database::open_memory().unwrap();
+        let mut entry = make_history("undo-1", "Undo.Me");
+        entry.nzb_data = Some(b"<nzb/>".to_vec());
+        entry.retry_data = Some(b"retry".to_vec());
+        db.history_insert(&entry).unwrap();
+        db.history_insert(&make_history("other", "Other")).unwrap();
+
+        let now = Utc::now();
+        let trashed = db
+            .history_trash(
+                &["undo-1".into(), "missing".into()],
+                now + chrono::Duration::seconds(10),
+            )
+            .unwrap();
+        assert_eq!(trashed.len(), 1, "only the existing row is reported");
+        assert_eq!(trashed[0].id, "undo-1");
+        assert_eq!(db.history_count().unwrap(), 1);
+
+        assert!(db.history_get("undo-1").unwrap().is_none());
+        assert!(
+            db.history_get_listed(&["undo-1".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.history_list(10)
+                .unwrap()
+                .iter()
+                .all(|e| e.id != "undo-1")
+        );
+        let (page, total) = db.history_page(&HistoryFilter::default(), 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert!(page.iter().all(|e| e.id != "undo-1"));
+        assert!(
+            !db.history_categories().unwrap().is_empty(),
+            "another row still supplies the category"
+        );
+        assert!(
+            db.history_summaries(&HistoryFilter::default())
+                .unwrap()
+                .iter()
+                .all(|e| e.id != "undo-1")
+        );
+        assert!(
+            db.find_duplicate_candidates("Undo.Me", None)
+                .unwrap()
+                .is_empty(),
+            "a trashed row must not block a re-add"
+        );
+
+        // The blobs survive the trash, which is what makes undo lossless.
+        assert_eq!(
+            db.history_get_nzb_data("undo-1").unwrap().as_deref(),
+            Some(&b"<nzb/>"[..])
+        );
+        assert_eq!(
+            db.history_get_retry_data("undo-1").unwrap().as_deref(),
+            Some(&b"retry"[..])
+        );
+        assert_eq!(db.history_trashed_ids().unwrap(), vec!["undo-1"]);
+
+        let restored = db
+            .history_restore(&["undo-1".into(), "missing".into()], now)
+            .unwrap();
+        assert_eq!(restored, vec!["undo-1"]);
+        assert_eq!(db.history_count().unwrap(), 2);
+        let got = db.history_get("undo-1").unwrap().unwrap();
+        assert_eq!(got.name, "Undo.Me");
+        assert_eq!(
+            db.find_duplicate_candidates("Undo.Me", None).unwrap().len(),
+            1
+        );
+        assert!(db.history_trashed_ids().unwrap().is_empty());
+    }
+
+    /// The deadline is the whole contract: a restore is accepted up to it and
+    /// refused after it, and only a purge removes the expired row.
+    #[test]
+    fn history_restore_is_refused_after_the_deadline_until_a_purge() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("expiring", "Expiring"))
+            .unwrap();
+        let trashed_at = Utc::now();
+        let deadline = trashed_at + chrono::Duration::seconds(10);
+        db.history_trash(&["expiring".into()], deadline).unwrap();
+
+        let after = deadline + chrono::Duration::seconds(1);
+        assert!(
+            db.history_restore(&["expiring".into()], after)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.history_count().unwrap(), 0, "still hidden from reads");
+
+        // Not yet expired, and not purged by a sweep that runs before the
+        // deadline, so the row is still physically there.
+        assert!(db.history_purge_expired(trashed_at).unwrap().is_empty());
+        assert_eq!(db.history_trashed_ids().unwrap(), vec!["expiring"]);
+
+        let purged = db.history_purge_expired(after).unwrap();
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged[0].id, "expiring");
+        assert!(db.history_get_nzb_data("expiring").unwrap().is_none());
+        assert!(db.history_trashed_ids().unwrap().is_empty());
+    }
+
+    /// Expired rows are purged even when the deadline is already in the past
+    /// when the sweep runs, and the job's ledger rows go with them.
+    #[test]
+    fn history_purge_removes_the_row_and_its_ledger_entries() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("trash-ledger", "Ledger"))
+            .unwrap();
+        note_present(&db, "trash-ledger", 0);
+        db.history_trash(
+            &["trash-ledger".into()],
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert_eq!(db.history_purge_expired(Utc::now()).unwrap().len(), 1);
+        assert_eq!(ledger_rows(&db, "trash-ledger"), 0);
+    }
+
+    /// Retention counts only visible rows: a trashed row must not consume a
+    /// slot, and must not be deleted by the retention pass either.
+    #[test]
+    fn history_enforce_retention_ignores_trashed_rows() {
+        let db = Database::open_memory().unwrap();
+        for i in 0..3 {
+            db.history_insert(&make_history(&format!("keep-{i}"), &format!("Keep {i}")))
+                .unwrap();
+        }
+        db.history_insert(&make_history("trashed", "Trashed"))
+            .unwrap();
+        let future = Utc::now() + chrono::Duration::seconds(10);
+        db.history_trash(&["trashed".into()], future).unwrap();
+
+        db.history_enforce_retention(3).unwrap();
+        assert_eq!(db.history_count().unwrap(), 3);
+        assert_eq!(
+            db.history_trashed_ids().unwrap(),
+            vec!["trashed"],
+            "retention must leave the undo window to the purge deadline"
+        );
+
+        // Restoring after a retention pass still works while the window is open.
+        db.history_restore(&["trashed".into()], Utc::now()).unwrap();
+        assert_eq!(db.history_count().unwrap(), 4);
+    }
+
+    /// Applying the schema is one transaction, not one per migration.
+    ///
+    /// Each migration used to commit separately, and every commit is an fsync.
+    /// On a contended volume those serialise: 19 commits were enough to keep
+    /// the backend from ever binding its port inside the e2e health timeout.
+    /// The version row must therefore appear only once the whole batch has
+    /// succeeded, and a re-open of an up-to-date database must write nothing.
+    #[test]
+    fn fresh_database_migrates_in_one_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let db = Database::open(&path).unwrap();
+
+        let version: u32 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(version >= 21, "schema should reach v21, got {version}");
+
+        // Every migration's objects are present, which is only true if the
+        // single batch ran to the end before stamping the version.
+        for table in ["queue", "history", "settings", "history_list_meta"] {
+            let exists: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} should exist after migrating");
+        }
+
+        // Re-opening an up-to-date database has no migration to apply, so it
+        // must not touch schema_version at all.
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        let versions: i64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(versions, 1, "the version row is written exactly once");
+    }
+
     /// A lock held briefly by another connection (backup tool, second
     /// process) must be waited on, not turned into an immediate SQLITE_BUSY.
     #[test]
@@ -2369,5 +3732,636 @@ mod tests {
     fn test_settings_missing_key() {
         let db = Database::open_memory().unwrap();
         assert_eq!(db.get_setting("nonexistent"), None);
+    }
+
+    fn seeded_history_db() -> (Database, Vec<HistoryEntry>) {
+        let db = Database::open_memory().unwrap();
+        let base = Utc::now();
+        for i in 0..40u32 {
+            let mut entry = make_history(&format!("h{i:02}"), &format!("Show.S01E{i:02}"));
+            if i % 3 == 0 {
+                entry.name = format!("Movie.Ünïcode.{i}");
+            }
+            entry.category = ["movies", "tv", ""][i as usize % 3].into();
+            if i % 4 == 0 {
+                entry.status = JobStatus::Failed;
+                entry.failure_code = Some(JobFailureCode::ArchivePasswordRequired);
+                entry.error_message = Some("Password required: archive".into());
+            }
+            entry.completed_at = base - chrono::Duration::hours(i64::from(i) * 7);
+            entry.added_at = entry.completed_at - chrono::Duration::minutes(5);
+            if i % 5 == 0 {
+                entry.nzb_data = Some(vec![7u8; 64 * 1024]);
+                entry.retry_data = Some(vec![9u8; 64 * 1024]);
+            }
+            db.history_insert(&entry).unwrap();
+        }
+        let all = db.history_list(usize::MAX).unwrap();
+        (db, all)
+    }
+
+    #[test]
+    fn history_page_matches_the_in_memory_filter() {
+        let (db, all) = seeded_history_db();
+        let now = Utc::now();
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(3)),
+                ..Default::default()
+            },
+            HistoryFilter {
+                status: Some(JobStatus::Failed),
+                ..Default::default()
+            },
+            HistoryFilter {
+                category: Some("tv".into()),
+                search: Some("s01e1".into()),
+                ..Default::default()
+            },
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(7)),
+                status: Some(JobStatus::Completed),
+                category: Some("movies".into()),
+                search: Some("MOVIE".into()),
+            },
+        ];
+        for filter in &filters {
+            let expected: Vec<&HistoryEntry> = all
+                .iter()
+                .filter(|e| filter.completed_since.is_none_or(|c| e.completed_at >= c))
+                .filter(|e| filter.status.is_none_or(|s| e.status == s))
+                .filter(|e| filter.category.as_ref().is_none_or(|c| &e.category == c))
+                .filter(|e| {
+                    filter
+                        .search
+                        .as_ref()
+                        .is_none_or(|s| e.name.to_lowercase().contains(&s.to_lowercase()))
+                })
+                .collect();
+            for (offset, limit) in [(0, 50), (0, 3), (2, 5), (100, 10)] {
+                let (page, total) = db.history_page(filter, offset, limit).unwrap();
+                assert_eq!(total, expected.len(), "{filter:?}");
+                let want: Vec<&str> = expected
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|e| e.id.as_str())
+                    .collect();
+                let got: Vec<&str> = page.iter().map(|e| e.id.as_str()).collect();
+                assert_eq!(got, want, "{filter:?} offset {offset} limit {limit}");
+            }
+            let summaries: Vec<String> = db
+                .history_summaries(filter)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            let want: Vec<String> = expected.iter().map(|e| e.id.clone()).collect();
+            assert_eq!(summaries, want, "{filter:?}");
+        }
+        assert_eq!(db.history_categories().unwrap(), vec!["movies", "tv"]);
+    }
+
+    /// The panel's statistics now come from SQL aggregates plus the failed
+    /// rows' error text. They must equal the fold the endpoint used to run
+    /// over whole summaries, for every filter the panel sends: the unfiltered
+    /// window, a days window, a status filter and a category+search filter.
+    #[test]
+    fn history_window_stats_match_the_fold_over_summaries() {
+        let (db, all) = seeded_history_db();
+        let now = Utc::now();
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(3)),
+                ..Default::default()
+            },
+            HistoryFilter {
+                status: Some(JobStatus::Failed),
+                ..Default::default()
+            },
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(7)),
+                status: Some(JobStatus::Completed),
+                category: Some("movies".into()),
+                search: Some("MOVIE".into()),
+            },
+        ];
+        for filter in &filters {
+            let in_window: Vec<&HistoryEntry> = all
+                .iter()
+                .filter(|e| filter.completed_since.is_none_or(|c| e.completed_at >= c))
+                .filter(|e| filter.status.is_none_or(|s| e.status == s))
+                .filter(|e| filter.category.as_ref().is_none_or(|c| &e.category == c))
+                .filter(|e| {
+                    filter
+                        .search
+                        .as_ref()
+                        .is_none_or(|s| e.name.to_lowercase().contains(&s.to_lowercase()))
+                })
+                .collect();
+
+            let completed: Vec<&&HistoryEntry> = in_window
+                .iter()
+                .filter(|e| e.status == JobStatus::Completed)
+                .collect();
+            let expected = HistoryWindowStats {
+                completed: completed.len() as u64,
+                completed_bytes: completed.iter().map(|e| e.total_bytes).sum(),
+                completed_duration_ms: completed
+                    .iter()
+                    .map(|e| (e.completed_at - e.added_at).num_milliseconds())
+                    .sum(),
+                failed: in_window
+                    .iter()
+                    .filter(|e| e.status == JobStatus::Failed)
+                    .count() as u64,
+            };
+            assert_eq!(
+                db.history_window_stats(filter).unwrap(),
+                expected,
+                "{filter:?}"
+            );
+
+            // Failure reasons are grouped from the messages, newest first.
+            let want_messages: Vec<Option<String>> = {
+                let mut failed: Vec<&&HistoryEntry> = in_window
+                    .iter()
+                    .filter(|e| e.status == JobStatus::Failed)
+                    .collect();
+                failed.sort_by_key(|e| std::cmp::Reverse(e.completed_at));
+                failed.iter().map(|e| e.error_message.clone()).collect()
+            };
+            assert_eq!(
+                db.history_failure_messages(filter).unwrap(),
+                want_messages,
+                "{filter:?}"
+            );
+        }
+    }
+
+    /// Reason text that differs only after the first clause must group the way
+    /// the old Rust fold grouped it: split on the first `.` or `:`, keep 32
+    /// chars, and treat a missing message as `unknown`.
+    #[test]
+    fn history_window_stats_aggregate_edge_case_statuses_and_messages() {
+        let db = Database::open_memory().unwrap();
+        let now = Utc::now();
+        let cases: [(&str, JobStatus, Option<&str>); 5] = [
+            ("a", JobStatus::Completed, None),
+            ("b", JobStatus::Completed, None),
+            ("c", JobStatus::Failed, Some("CRC mismatch: volume 2")),
+            ("d", JobStatus::Failed, Some("CRC mismatch. volume 3")),
+            ("e", JobStatus::Failed, None),
+        ];
+        for (i, (id, status, message)) in cases.iter().enumerate() {
+            let mut entry = make_history(id, id);
+            entry.status = *status;
+            if *status == JobStatus::Failed {
+                entry.failure_code = Some(JobFailureCode::ArchiveInvalid);
+            }
+            entry.total_bytes = 1_000;
+            entry.completed_at = now - chrono::Duration::minutes(i as i64);
+            entry.added_at = entry.completed_at - chrono::Duration::seconds(30);
+            entry.error_message = message.map(str::to_owned);
+            db.history_insert(&entry).unwrap();
+        }
+
+        let stats = db.history_window_stats(&HistoryFilter::default()).unwrap();
+        assert_eq!(
+            stats,
+            HistoryWindowStats {
+                completed: 2,
+                completed_bytes: 2_000,
+                completed_duration_ms: 60_000,
+                failed: 3,
+            }
+        );
+        // Newest first, and a NULL message survives as NULL so the caller can
+        // render its `unknown` fallback.
+        assert_eq!(
+            db.history_failure_messages(&HistoryFilter::default())
+                .unwrap(),
+            vec![
+                Some("CRC mismatch: volume 2".into()),
+                Some("CRC mismatch. volume 3".into()),
+                None,
+            ]
+        );
+
+        // A trashed row is in neither aggregate nor the message list.
+        db.history_trash(&["c".to_string()], now + chrono::Duration::seconds(5))
+            .unwrap();
+        let stats = db.history_window_stats(&HistoryFilter::default()).unwrap();
+        assert_eq!((stats.completed, stats.failed), (2, 2));
+        assert_eq!(
+            db.history_failure_messages(&HistoryFilter::default())
+                .unwrap(),
+            vec![Some("CRC mismatch. volume 3".into()), None]
+        );
+    }
+
+    /// The history panel's aggregates, category list and page count must all
+    /// run off an index and never `SCAN history`, so a cold load neither
+    /// walks the wide table nor reaches its overflow pages, where the stored
+    /// NZB blobs live. The panel sends two windows: the whole history (the
+    /// aggregates and page) and a days window.
+    ///
+    /// The category list is deliberately unfiltered — the panel offers every
+    /// category in the history — and a days filter on it would have no index
+    /// to scan in date order, so it is asserted once, outside the window loop.
+    #[test]
+    fn history_panel_aggregates_use_covering_indexes() {
+        let (db, _) = seeded_history_db();
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(Utc::now() - chrono::Duration::days(3)),
+                ..Default::default()
+            },
+        ];
+        for filter in &filters {
+            let (where_sql, args) = filter.to_sql();
+            // Without a date bound the count is answered by the implicit
+            // unique index on `history.id`; a days window narrows it through
+            // the statistics' covering index instead.
+            let count_index = if filter.completed_since.is_some() {
+                "idx_h_stats_cover"
+            } else {
+                "sqlite_autoindex_history_1"
+            };
+            let statements = [
+                (
+                    "window stats",
+                    history_window_stats_sql(&where_sql),
+                    "idx_h_stats_cover",
+                ),
+                (
+                    "failure messages",
+                    history_failure_messages_sql(&where_sql),
+                    "idx_h_fail_cover",
+                ),
+                (
+                    "page count",
+                    format!(
+                        "SELECT COUNT(*) FROM history h{}",
+                        with_condition(
+                            &where_sql,
+                            "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+                        )
+                    ),
+                    count_index,
+                ),
+            ];
+            for (label, sql, index) in &statements {
+                let mut stmt = db
+                    .conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap();
+                let bound: Vec<&dyn rusqlite::ToSql> =
+                    args.iter().map(|a| a as &dyn rusqlite::ToSql).collect();
+                let plan: Vec<String> = stmt
+                    .query_map(rusqlite::params_from_iter(bound), |row| row.get(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                let plan = plan.join("\n");
+                assert!(
+                    !plan.contains("SCAN history"),
+                    "{label} scans the history table: {sql}\n{plan}"
+                );
+                assert!(
+                    plan.contains(&format!("USING INDEX {index}"))
+                        || plan.contains(&format!("USING COVERING INDEX {index}")),
+                    "{label} does not use {index}: {sql}\n{plan}"
+                );
+            }
+        }
+
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", history_categories_sql()))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("USING COVERING INDEX idx_h_cat_cover"),
+            "categories do not use idx_h_cat_cover\n{plan}"
+        );
+    }
+
+    #[test]
+    fn history_list_rows_flag_stored_nzbs_and_keep_full_fields() {
+        let (db, all) = seeded_history_db();
+        let (page, _) = db.history_page(&HistoryFilter::default(), 0, 100).unwrap();
+        assert_eq!(page.len(), all.len());
+        for entry in &page {
+            let has_nzb = entry.id[1..].parse::<u32>().unwrap() % 5 == 0;
+            assert_eq!(entry.nzb_data.is_some(), has_nzb, "{}", entry.id);
+            assert!(entry.nzb_data.as_ref().is_none_or(Vec::is_empty));
+            assert!(entry.retry_data.is_none());
+            assert_eq!(entry.stages.len(), 1);
+        }
+        let ids = vec!["h05".to_string(), "missing".to_string(), "h01".to_string()];
+        let listed = db.history_get_listed(&ids).unwrap();
+        let got: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(got, ["h05", "h01"]);
+        assert!(listed[0].nzb_data.is_some());
+    }
+
+    /// A list page must never load `nzb_data` or `retry_data` content: the
+    /// only access to `nzb_data` is the header-only `typeof()` probe
+    /// (OP_Column with OPFLAG_TYPEOFARG), and `retry_data` is not touched.
+    #[test]
+    fn history_page_query_does_not_read_blob_columns() {
+        const OPFLAG_TYPEOFARG: i64 = 0x80;
+        let (db, _) = seeded_history_db();
+        let column_index = |name: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT cid FROM pragma_table_info('history') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let nzb_col = column_index("nzb_data");
+        let retry_col = column_index("retry_data");
+        let root: i64 = db
+            .conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(Utc::now()),
+                status: Some(JobStatus::Failed),
+                category: Some("tv".into()),
+                search: Some("x".into()),
+            },
+        ];
+        for filter in &filters {
+            let (where_sql, args) = filter.to_sql();
+            let sql = format!("EXPLAIN {}", history_page_sql(&where_sql, args.len()));
+            let mut stmt = db.conn.prepare(&sql).unwrap();
+            let ops: Vec<(String, i64, i64, i64)> = stmt
+                .query_map(
+                    rusqlite::params_from_iter(
+                        args.iter()
+                            .map(|a| a.as_ref())
+                            .chain([&1i64 as &dyn rusqlite::ToSql, &0i64]),
+                    ),
+                    |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(6)?)),
+                )
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let table_cursors: Vec<i64> = ops
+                .iter()
+                .filter(|(op, _, p2, _)| op == "OpenRead" && *p2 == root)
+                .map(|(_, p1, _, _)| *p1)
+                .collect();
+            assert!(!table_cursors.is_empty());
+            let mut probed_nzb = false;
+            for (op, p1, p2, p5) in &ops {
+                if op != "Column" || !table_cursors.contains(p1) {
+                    continue;
+                }
+                assert_ne!(*p2, retry_col, "list page reads retry_data");
+                assert!(
+                    *p2 <= nzb_col,
+                    "list page reads history column {p2}, stored after nzb_data"
+                );
+                if *p2 == nzb_col {
+                    assert_ne!(p5 & OPFLAG_TYPEOFARG, 0, "list page loads nzb_data");
+                    probed_nzb = true;
+                }
+            }
+            assert!(probed_nzb, "has_nzb probe missing from the plan");
+        }
+    }
+
+    #[test]
+    fn history_client_removal_marks_the_row_until_it_is_deleted() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("kept", "Kept")).unwrap();
+        db.history_insert(&make_history("plain", "Plain")).unwrap();
+        let marked = db
+            .history_mark_client_removed(
+                &["kept".to_string(), "missing".to_string()],
+                "Sonarr",
+                Utc::now(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(marked, 1, "an unknown id is skipped");
+
+        let removal = db.history_get("kept").unwrap().unwrap().client_removal;
+        assert_eq!(
+            removal.as_ref().map(|r| r.removed_by.as_str()),
+            Some("Sonarr")
+        );
+        assert!(removal.unwrap().files_deleted);
+        let listed = db.history_list(10).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.id == "kept" && e.client_removal.is_some())
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.id == "plain" && e.client_removal.is_none())
+        );
+        assert_eq!(
+            db.history_client_removed_ids().unwrap(),
+            std::collections::HashSet::from(["kept".to_string()])
+        );
+
+        // A UI delete still goes through the undo window, then drops the
+        // marker with the row.
+        let trashed = db
+            .history_trash(
+                &["kept".to_string()],
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert!(db.history_get("kept").unwrap().is_none());
+        db.history_remove("kept").unwrap();
+        assert!(db.history_client_removed_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_list_meta_follows_inserts_deletes_and_retention() {
+        let (db, _) = seeded_history_db();
+        let meta_count = |db: &Database| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM history_list_meta", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let history_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(meta_count(&db), history_count);
+
+        let listed = db.history_list(1).unwrap();
+        let first = listed[0].clone();
+        let full = db.history_get(&first.id).unwrap().unwrap();
+        assert_eq!(full.failure_code, first.failure_code);
+        assert_eq!(full.download_time_secs, first.download_time_secs);
+
+        db.history_remove(&first.id).unwrap();
+        assert_eq!(meta_count(&db), history_count - 1);
+        db.history_enforce_retention(2).unwrap();
+        assert_eq!(meta_count(&db), 2);
+        db.history_clear().unwrap();
+        assert_eq!(meta_count(&db), 0);
+    }
+
+    // --- Damage-ledger pruning (WI-1868) ---
+
+    use crate::damage_ledger::{ArticleKey, Outcome};
+
+    fn ledger_t(secs: i64) -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    /// Record a confirmed hole for `scope`, confirmed at `ledger_t(2)`, so it
+    /// expires at `ledger_t(2) + HOLE_TTL_SECS`.
+    fn note_hole(db: &Database, scope: &str, segment: u32) {
+        let key = ArticleKey::new(scope, 0, segment);
+        let srv = vec!["a".to_string()];
+        let refused = Outcome::Refused { server: "a".into() };
+        db.ledger_note(&key, "<m>", &refused, &srv, ledger_t(0))
+            .unwrap();
+        db.ledger_note(&key, "<m>", &refused, &srv, ledger_t(2))
+            .unwrap();
+    }
+
+    fn note_present(db: &Database, scope: &str, segment: u32) {
+        let key = ArticleKey::new(scope, 0, segment);
+        db.ledger_note(
+            &key,
+            "<m>",
+            &Outcome::Present,
+            &["a".to_string()],
+            ledger_t(0),
+        )
+        .unwrap();
+    }
+
+    fn ledger_rows(db: &Database, scope: &str) -> usize {
+        db.ledger_load_file(scope, 0).unwrap().len()
+    }
+
+    #[test]
+    fn history_remove_drops_the_jobs_ledger_rows() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("done-1", "A")).unwrap();
+        db.history_insert(&make_history("done-2", "B")).unwrap();
+        note_present(&db, "done-1", 0);
+        note_hole(&db, "done-1", 1);
+        note_present(&db, "done-2", 0);
+
+        db.history_remove("done-1").unwrap();
+
+        assert_eq!(ledger_rows(&db, "done-1"), 0);
+        assert_eq!(ledger_rows(&db, "done-2"), 1, "other jobs keep their rows");
+    }
+
+    #[test]
+    fn rows_of_a_retried_job_survive_deleting_its_history_entry() {
+        let db = Database::open_memory().unwrap();
+        // The failed original sits in history; its retry runs under a new id.
+        db.history_insert(&make_history("orig", "Release")).unwrap();
+        db.queue_insert(&make_job("retry", "Release")).unwrap();
+        note_hole(&db, "orig", 0);
+        note_hole(&db, "retry", 0);
+        note_present(&db, "retry", 1);
+
+        db.history_remove("orig").unwrap();
+
+        assert_eq!(ledger_rows(&db, "orig"), 0);
+        assert_eq!(ledger_rows(&db, "retry"), 2);
+    }
+
+    #[test]
+    fn a_job_still_queued_keeps_its_rows_when_its_history_row_goes() {
+        // A failed job can be in history and the queue at once until the
+        // queue view is removed.
+        let db = Database::open_memory().unwrap();
+        db.queue_insert(&make_job("both", "R")).unwrap();
+        db.history_insert(&make_history("both", "R")).unwrap();
+        note_hole(&db, "both", 0);
+
+        db.history_remove("both").unwrap();
+        assert_eq!(ledger_rows(&db, "both"), 1);
+
+        db.queue_remove("both").unwrap();
+        assert_eq!(db.ledger_prune(ledger_t(3)).unwrap(), 1);
+        assert_eq!(ledger_rows(&db, "both"), 0);
+    }
+
+    #[test]
+    fn history_clear_and_retention_drop_ledger_rows() {
+        let db = Database::open_memory().unwrap();
+        let mut old = make_history("old", "Old");
+        old.completed_at = Utc::now() - chrono::Duration::days(2);
+        db.history_insert(&old).unwrap();
+        db.history_insert(&make_history("new", "New")).unwrap();
+        db.queue_insert(&make_job("live", "Live")).unwrap();
+        for scope in ["old", "new", "live"] {
+            note_present(&db, scope, 0);
+        }
+
+        db.history_enforce_retention(1).unwrap();
+        assert_eq!(ledger_rows(&db, "old"), 0, "aged out with its history row");
+        assert_eq!(ledger_rows(&db, "new"), 1);
+
+        db.history_clear().unwrap();
+        assert_eq!(ledger_rows(&db, "new"), 0);
+        assert_eq!(ledger_rows(&db, "live"), 1, "queued jobs are untouched");
+    }
+
+    #[test]
+    fn prune_drops_expired_holes_only_for_jobs_no_longer_queued() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("hist", "H")).unwrap();
+        db.queue_insert(&make_job("live", "L")).unwrap();
+        note_hole(&db, "hist", 0);
+        note_present(&db, "hist", 1);
+        note_hole(&db, "live", 0);
+        // A late ledger write for a job already removed everywhere.
+        note_present(&db, "gone", 0);
+
+        // Before the TTL: only the orphan goes.
+        let before_expiry = ledger_t(2 + crate::damage_ledger::HOLE_TTL_SECS - 1);
+        assert_eq!(db.ledger_prune(before_expiry).unwrap(), 1);
+        assert_eq!(ledger_rows(&db, "gone"), 0);
+        assert_eq!(ledger_rows(&db, "hist"), 2);
+
+        // At the TTL: the history job's expired hole goes; its present row and
+        // the queued job's hole stay.
+        let at_expiry = ledger_t(2 + crate::damage_ledger::HOLE_TTL_SECS);
+        assert_eq!(db.ledger_prune(at_expiry).unwrap(), 1);
+        let left = db.ledger_load_file("hist", 0).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key.segment_number, 1);
+        assert_eq!(ledger_rows(&db, "live"), 1);
     }
 }

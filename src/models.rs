@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 // ---------------------------------------------------------------------------
 // Job status lifecycle
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
@@ -41,7 +42,7 @@ impl std::fmt::Display for JobStatus {
 ///
 /// These carry stable snake_case wire values so consumers key off a typed code
 /// instead of parsing human-readable diagnostic prose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobFailureCode {
     ArticlesUnavailable,
@@ -85,7 +86,7 @@ impl std::str::FromStr for JobFailureCode {
 // Priority
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, ToSchema)]
 pub enum Priority {
     Low = 0,
     #[default]
@@ -131,7 +132,7 @@ impl<'de> Deserialize<'de> for Priority {
 // ---------------------------------------------------------------------------
 
 /// Per-server article download statistics for a job.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ServerArticleStats {
     pub server_id: String,
     pub server_name: String,
@@ -140,8 +141,35 @@ pub struct ServerArticleStats {
     pub bytes_downloaded: u64,
 }
 
+/// The verdict for one PAR2 slice, as the download engine left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SliceVerdict {
+    /// Not fully written, not checked, or its only gap is an article whose
+    /// absence was not confirmed by every server.
+    Unknown,
+    /// Fully written and its MD5 and CRC32 match the PAR2 checksums.
+    Verified,
+    /// A checksum mismatched, or an article overlapping it is confirmed
+    /// missing on every server.
+    Damaged,
+}
+
+/// The per-job slice map the download engine emits with `JobFinished`
+/// (WI-1228), read by the hopeless check (WI-145) and the verify skip
+/// (WI-147).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SliceMapSummary {
+    /// One verdict per global slice, in PAR2 Main-packet file order.
+    pub states: Vec<SliceVerdict>,
+    /// Recovery slices carried by the PAR2 file the map was built from.
+    pub recovery_block_count: u32,
+    pub damaged: usize,
+    pub unknown: usize,
+}
+
 /// A complete download job (parsed from one NZB file).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NzbJob {
     /// Unique job identifier
     pub id: String,
@@ -172,8 +200,10 @@ pub struct NzbJob {
     /// When the job completed (if applicable)
     pub completed_at: Option<DateTime<Utc>>,
     /// Working directory for this job (incomplete)
+    #[schema(value_type = String)]
     pub work_dir: PathBuf,
     /// Final output directory
+    #[schema(value_type = String)]
     pub output_dir: PathBuf,
     /// Optional password for extraction
     pub password: Option<String>,
@@ -195,13 +225,23 @@ pub struct NzbJob {
     /// "+Delete"); `None` or `Some(true)` deletes them, the default.
     #[serde(default)]
     pub delete_archives: Option<bool>,
+    /// In-flight PAR2 slice verdicts from the download phase (WI-144). Set
+    /// when the download ends, if the job's PAR2 index arrived during it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_map: Option<SliceMapSummary>,
+    /// Bytes of PAR2 recovery volumes held back by `par2.defer_volumes` and
+    /// not yet released. Queue sizes and ETAs leave them out, as SABnzbd
+    /// does; a release grows the job's size by the volumes it lets through.
+    /// Filled in by the queue snapshot, never persisted.
+    #[serde(default)]
+    pub held_par2_bytes: u64,
     /// Files in this job
     #[serde(skip)]
     pub files: Vec<NzbFile>,
 }
 
 /// A single file within an NZB job (collection of NNTP articles).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NzbFile {
     /// Unique file identifier
     pub id: String,
@@ -236,7 +276,7 @@ pub use nzb_nntp::Article;
 // ---------------------------------------------------------------------------
 
 /// A history entry for a completed or failed job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HistoryEntry {
     pub id: String,
     pub name: String,
@@ -249,6 +289,7 @@ pub struct HistoryEntry {
     /// Active download duration, excluding queue wait and pauses.
     #[serde(default)]
     pub download_time_secs: Option<f64>,
+    #[schema(value_type = String)]
     pub output_dir: PathBuf,
     /// Post-processing stages with results
     pub stages: Vec<StageResult>,
@@ -267,6 +308,19 @@ pub struct HistoryEntry {
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,
+    /// PAR2 recovery volumes downloaded, out of
+    /// [`par2_volumes_available`](Self::par2_volumes_available) in the NZB.
+    /// Fewer than available when `par2.defer_volumes` left some unfetched.
+    /// `None` for rows recorded before it was stored.
+    #[serde(default)]
+    pub par2_volumes_fetched: Option<u32>,
+    /// PAR2 recovery volumes the NZB carries.
+    #[serde(default)]
+    pub par2_volumes_available: Option<u32>,
+    /// Set when an *arr removed the job through the SABnzbd API and the row
+    /// was kept (`general.keep_history_on_arr_delete`).
+    #[serde(default)]
+    pub client_removal: Option<HistoryClientRemoval>,
     /// Raw NZB XML data (for retry)
     #[serde(skip_serializing)]
     pub nzb_data: Option<Vec<u8>>,
@@ -275,10 +329,21 @@ pub struct HistoryEntry {
     pub retry_data: Option<Vec<u8>>,
 }
 
+/// How an external client (an *arr, through the SABnzbd API) removed a
+/// history entry that rustnzb kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HistoryClientRemoval {
+    /// Client name, from its `User-Agent` (e.g. `Sonarr`).
+    pub removed_by: String,
+    pub removed_at: DateTime<Utc>,
+    /// Whether the client asked for the files to be deleted (`del_files=1`).
+    pub files_deleted: bool,
+}
+
 /// Immutable statistics ledger row recorded when a job leaves the queue.
 /// Unlike history, these compact rows are retained when users clear or prune
 /// individual history entries so lifetime counters remain meaningful.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DownloadStatistic {
     pub job_id: String,
     pub completed_at: DateTime<Utc>,
@@ -294,7 +359,7 @@ pub struct DownloadStatistic {
 ///
 /// This row intentionally outlives queue and history retention so a caller can
 /// resolve an ambiguous admission response without creating another job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueAdmission {
     pub idempotency_key: String,
     pub payload_digest: String,
@@ -302,13 +367,14 @@ pub struct QueueAdmission {
     pub accepted_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "location", rename_all = "snake_case")]
 pub enum QueueAdmissionState {
     Queue {
         status: JobStatus,
         total_bytes: u64,
         downloaded_bytes: u64,
+        #[schema(value_type = String)]
         output_dir: PathBuf,
         error_message: Option<String>,
     },
@@ -317,6 +383,7 @@ pub enum QueueAdmissionState {
         total_bytes: u64,
         downloaded_bytes: u64,
         completed_at: DateTime<Utc>,
+        #[schema(value_type = String)]
         output_dir: PathBuf,
         error_message: Option<String>,
         failure_code: Option<JobFailureCode>,
@@ -325,7 +392,7 @@ pub enum QueueAdmissionState {
 }
 
 /// Exact observation of a durable admission and its current engine location.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueAdmissionObservation {
     pub admission: QueueAdmission,
     pub state: QueueAdmissionState,
@@ -337,7 +404,7 @@ pub enum QueueAdmissionOutcome {
     Existing(QueueAdmission),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StageResult {
     pub name: String,
     pub status: StageStatus,
@@ -345,7 +412,7 @@ pub struct StageResult {
     pub duration_secs: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StageStatus {
     Success,
@@ -358,7 +425,7 @@ pub enum StageStatus {
 // ---------------------------------------------------------------------------
 
 /// A discovered item from an RSS feed, persisted in the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RssItem {
     /// Feed entry ID (from the RSS feed)
     pub id: String,
@@ -383,7 +450,7 @@ pub struct RssItem {
 }
 
 /// A download rule that automatically enqueues matching RSS feed items.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RssRule {
     /// Unique rule identifier
     pub id: String,
@@ -406,7 +473,7 @@ pub struct RssRule {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupRow {
     pub id: i64,
     pub name: String,
@@ -423,7 +490,7 @@ pub struct GroupRow {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HeaderRow {
     pub id: i64,
     pub group_id: i64,
@@ -440,7 +507,7 @@ pub struct HeaderRow {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ThreadSummary {
     pub root_message_id: String,
     pub subject: String,
@@ -452,7 +519,7 @@ pub struct ThreadSummary {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ThreadArticle {
     #[serde(flatten)]
     pub header: HeaderRow,
@@ -460,13 +527,13 @@ pub struct ThreadArticle {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MarkReadInput {
     pub header_ids: Vec<i64>,
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct DownloadSelectedInput {
     pub message_ids: Vec<String>,
     pub name: Option<String>,
@@ -637,4 +704,26 @@ mod tests {
         assert_eq!(restored.articles_failed, 5);
         assert_eq!(restored.bytes_downloaded, 75_000_000);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate detection
+// ---------------------------------------------------------------------------
+
+/// Where a duplicate candidate was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateLocation {
+    Queue,
+    History,
+}
+
+/// A queued or history job that an incoming NZB matches by name (ignoring
+/// ASCII case) or by content digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateMatch {
+    pub id: String,
+    pub name: String,
+    pub location: DuplicateLocation,
+    pub by_name: bool,
+    pub by_digest: bool,
 }

@@ -319,6 +319,24 @@ impl Database {
         Ok(confirm)
     }
 
+    /// Record many fetch outcomes in one transaction, so a batch costs one
+    /// commit rather than one per article. Each note carries the time its
+    /// outcome was observed. Returns each outcome's [`ConfirmNeeded`], in
+    /// order. Outcomes for the same article apply in the order given.
+    pub fn ledger_note_batch(
+        &self,
+        notes: &[(ArticleKey, String, Outcome, DateTime<Utc>)],
+        enabled_servers: &[String],
+    ) -> Result<Vec<ConfirmNeeded>, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut confirms = Vec::with_capacity(notes.len());
+        for (key, message_id, outcome, at) in notes {
+            confirms.push(self.ledger_note(key, message_id, outcome, enabled_servers, *at)?);
+        }
+        tx.commit()?;
+        Ok(confirms)
+    }
+
     /// Guidance before fetching an article: skip a live hole, re-probe an
     /// expired one, otherwise fetch normally.
     pub fn ledger_consult(
@@ -393,6 +411,36 @@ impl Database {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Drop ledger rows nothing can use any more, and return how many went.
+    ///
+    /// In this database a `scope_id` is a job id. A job in the queue keeps
+    /// every row. Otherwise rows go when the job is in neither the queue nor
+    /// history (removed, or aged out), and confirmed holes past `expires_at`
+    /// go even while the job is still in history, since a re-probe would
+    /// ignore them anyway. A retry runs under a new job id, so it never
+    /// depends on the rows of the history entry it came from.
+    pub fn ledger_prune(&self, now: DateTime<Utc>) -> Result<usize, NzbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM damage_ledger
+             WHERE scope_id NOT IN (SELECT id FROM queue)
+               AND (scope_id NOT IN (SELECT id FROM history)
+                    OR (state = 'confirmed_missing'
+                        AND expires_at IS NOT NULL
+                        AND julianday(expires_at) <= julianday(?1)))",
+            params![now.to_rfc3339()],
+        )?)
+    }
+
+    /// Drop the rows of jobs that are in neither the queue nor history.
+    pub(crate) fn ledger_drop_orphans(&self) -> Result<usize, NzbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM damage_ledger
+             WHERE scope_id NOT IN (SELECT id FROM queue)
+               AND scope_id NOT IN (SELECT id FROM history)",
+            [],
+        )?)
     }
 
     fn ledger_get(&self, key: &ArticleKey) -> Result<Option<LedgerRecord>, NzbError> {
@@ -723,5 +771,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(db.ledger_file_gone_ratio("job-2", 0).unwrap(), 0.5);
+    }
+
+    #[test]
+    fn note_batch_applies_in_order_with_each_notes_time() {
+        let db = Database::open_memory().unwrap();
+        let srv = servers(&["a", "b"]);
+        let key = ArticleKey::new("job-3", 0, 1);
+        let refused = |server: &str| Outcome::Refused {
+            server: server.into(),
+        };
+        // Two fast refusals, then a confirming one past the guard: one batch.
+        let notes = vec![
+            (key.clone(), "<m>".to_string(), refused("a"), t(0)),
+            (key.clone(), "<m>".to_string(), refused("b"), t(0)),
+            (key.clone(), "<m>".to_string(), refused("a"), t(2)),
+        ];
+        let confirms = db.ledger_note_batch(&notes, &srv).unwrap();
+        assert_eq!(
+            confirms,
+            vec![
+                ConfirmNeeded(true),
+                ConfirmNeeded(true),
+                ConfirmNeeded(false)
+            ]
+        );
+        let records = db.ledger_load_file("job-3", 0).unwrap();
+        assert_eq!(records[0].state, LedgerState::ConfirmedMissing);
     }
 }

@@ -2,11 +2,19 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Top-level application configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+///
+/// Unknown keys are rejected at parse time (`deny_unknown_fields`), so a typo
+/// in `config.toml` fails loudly instead of silently keeping the default.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
+    /// Schema version of the file, stamped on every save. A file without it
+    /// is version 0 and is migrated on load (see `config_store::migrate`).
+    #[serde(default)]
+    pub config_version: u32,
     pub general: GeneralConfig,
     pub servers: Vec<ServerConfig>,
     pub categories: Vec<CategoryConfig>,
@@ -16,23 +24,95 @@ pub struct AppConfig {
     pub rss_feeds: Vec<RssFeedConfig>,
     #[serde(default)]
     pub dav: DavConfig,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub par2: Par2Config,
+    #[serde(default)]
+    pub schedule: crate::schedule::ScheduleConfig,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: crate::config_store::CONFIG_VERSION,
             general: GeneralConfig::default(),
             servers: Vec::new(),
             categories: vec![CategoryConfig::default()],
             otel: OtelConfig::default(),
             rss_feeds: Vec::new(),
             dav: DavConfig::default(),
+            notifications: NotificationConfig::default(),
+            par2: Par2Config::default(),
+            schedule: crate::schedule::ScheduleConfig::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// PAR2 handling during download.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Par2Config {
+    /// Hold PAR2 recovery volumes until the in-flight slice map shows
+    /// damage, then fetch only as many as the damage needs. Off fetches every
+    /// volume up front.
+    pub defer_volumes: bool,
+    /// Accept a PAR2 set as verified from the in-flight slice map when it
+    /// covers every file, skipping the disk verify pass. Off always verifies
+    /// from disk.
+    pub trust_inflight_verify: bool,
+}
+
+impl Default for Par2Config {
+    fn default() -> Self {
+        Self {
+            defer_volumes: true,
+            trust_inflight_verify: true,
+        }
+    }
+}
+
+/// What admission does when an incoming NZB matches a queued or history job
+/// by name or by content digest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DuplicatePolicy {
+    /// Admit the NZB without checking for a match.
+    Allow,
+    /// Admit the NZB and record the match in the log (default).
+    #[default]
+    Warn,
+    /// Refuse the NZB; the existing job is left as it is.
+    Skip,
+}
+
+impl std::fmt::Display for DuplicatePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Warn => "warn",
+            Self::Skip => "skip",
+        })
+    }
+}
+
+impl std::str::FromStr for DuplicatePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allow" => Ok(Self::Allow),
+            "warn" => Ok(Self::Warn),
+            "skip" => Ok(Self::Skip),
+            other => Err(format!(
+                "duplicate_policy must be allow, warn or skip, not `{other}`"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     /// HTTP API listen address
     pub listen_addr: String,
@@ -41,10 +121,13 @@ pub struct GeneralConfig {
     /// API key for authentication
     pub api_key: Option<String>,
     /// Directory for incomplete downloads
+    #[schema(value_type = String)]
     pub incomplete_dir: PathBuf,
     /// Directory for completed downloads
+    #[schema(value_type = String)]
     pub complete_dir: PathBuf,
     /// Directory for application data (DB, logs)
+    #[schema(value_type = String)]
     pub data_dir: PathBuf,
     /// Download speed limit in bytes/sec (0 = unlimited)
     pub speed_limit_bps: u64,
@@ -52,11 +135,20 @@ pub struct GeneralConfig {
     pub cache_size: u64,
     /// Log level
     pub log_level: String,
+    /// The level the debug-logging toggle replaced, restored when it is
+    /// turned off again. Unset while the toggle is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level_before_debug: Option<String>,
     /// Log file path (None = stdout only)
+    #[schema(value_type = Option<String>)]
     pub log_file: Option<PathBuf>,
     /// History retention: how many NZBs to keep in history.
     /// `None` or `Some(0)` both mean keep all; see [`normalize_history_retention`].
     pub history_retention: Option<usize>,
+    /// Keep the History row when an *arr removes a job through the SABnzbd
+    /// API (the files are still deleted as asked). Off restores SABnzbd's
+    /// behaviour of dropping the row too.
+    pub keep_history_on_arr_delete: bool,
     /// Max number of NZBs downloading simultaneously (default 1).
     /// `0` means unlimited: every queued job may download at once.
     pub max_active_downloads: usize,
@@ -73,6 +165,7 @@ pub struct GeneralConfig {
     #[serde(default = "default_min_free_space")]
     pub min_free_space_bytes: u64,
     /// Directory to watch for new .nzb files to auto-enqueue
+    #[schema(value_type = Option<String>)]
     pub watch_dir: Option<PathBuf>,
     /// RSS feed history limit: how many feed items to keep (None = keep all, default 500)
     #[serde(default = "default_rss_history_limit")]
@@ -115,14 +208,31 @@ pub struct GeneralConfig {
     /// Remove downloaded RSS records after this many days. None keeps them.
     #[serde(default)]
     pub rss_downloaded_item_expiry_days: Option<u64>,
+    /// What to do when an incoming NZB matches a queued or history job by
+    /// name or content digest: `allow`, `warn` (default) or `skip`.
+    #[serde(default)]
+    pub duplicate_policy: DuplicatePolicy,
+    /// Directory that SABnzbd `addlocalfile` may read NZBs from. Unset refuses
+    /// the mode; a file outside this directory (after resolving symlinks and
+    /// `..`) is refused too.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub local_import_dir: Option<PathBuf>,
+    /// Keep the SABnzbd `change_complete_action` after it has run once. When
+    /// false (SABnzbd's default) the action is reset after each run.
+    #[serde(default)]
+    pub queue_complete_pers: bool,
     /// Optional directory containing post-processing scripts.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub scripts_dir: Option<PathBuf>,
     /// Script run after a successful post-processing job.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub script_success: Option<PathBuf>,
     /// Script run after a failed post-processing job.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub script_failure: Option<PathBuf>,
     /// Maximum runtime for a post-processing script.
     #[serde(default = "default_script_timeout_secs")]
@@ -148,6 +258,48 @@ pub struct GeneralConfig {
     /// oldest are pruned first. 0 keeps all fetched headers. Default: 100000.
     #[serde(default = "default_group_max_headers")]
     pub group_max_headers: usize,
+    /// Seconds to wait on shutdown for open HTTP connections and in-flight
+    /// downloads to finish before the process exits anyway. 0 waits forever.
+    /// Default: 30.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as IP
+    /// addresses or CIDR blocks. Wrong web-login passwords are delayed per
+    /// client address; behind a proxy every request comes from the proxy, so
+    /// list it here to count the real clients separately. Empty (the default)
+    /// ignores `X-Forwarded-For`.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// How long a confirmed password authorises further sensitive writes,
+    /// in seconds. Default 300 (five minutes). `0` means every sensitive
+    /// write must present the password again.
+    #[serde(default = "default_step_up_ttl_secs")]
+    pub step_up_ttl_secs: u64,
+}
+
+/// Parse `addr` or `addr/prefix` (IPv4 or IPv6, optionally in brackets) into
+/// a network address and prefix length. `None` if it is not one.
+pub fn parse_ip_network(entry: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr, prefix) = match entry.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (entry, None),
+    };
+    let addr = addr.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix {
+        Some(p) => p.parse::<u8>().ok().filter(|p| *p <= max)?,
+        None => max,
+    };
+    Some((ip, prefix))
+}
+
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+
+fn default_step_up_ttl_secs() -> u64 {
+    300
 }
 
 fn default_group_max_headers() -> usize {
@@ -196,6 +348,19 @@ pub fn normalize_history_retention(limit: Option<usize>) -> Option<usize> {
     limit.filter(|max| *max > 0)
 }
 
+/// Upper bound for `rss_downloaded_item_expiry_days`: 100 years.
+///
+/// The value is subtracted from `Utc::now()` when downloaded RSS items are
+/// pruned; a large enough span overflows chrono's `DateTime` range (about
+/// ±262 000 years) and panics. A hundred years is already far past any useful
+/// retention.
+pub const MAX_RSS_EXPIRY_DAYS: u64 = 36_500;
+
+/// Clamp a configured RSS expiry so the cutoff can always be computed.
+pub fn normalize_rss_expiry_days(days: Option<u64>) -> Option<u64> {
+    days.map(|days| days.min(MAX_RSS_EXPIRY_DAYS))
+}
+
 fn default_script_timeout_secs() -> u64 {
     300
 }
@@ -209,6 +374,7 @@ impl Default for GeneralConfig {
         Self {
             listen_addr: "0.0.0.0".into(),
             port: 9090,
+            step_up_ttl_secs: default_step_up_ttl_secs(),
             api_key: None,
             incomplete_dir: PathBuf::from("/downloads/incomplete"),
             complete_dir: PathBuf::from("/downloads/complete"),
@@ -216,8 +382,10 @@ impl Default for GeneralConfig {
             speed_limit_bps: 0,
             cache_size: 500 * 1024 * 1024, // 500 MB
             log_level: "info".into(),
+            log_level_before_debug: None,
             log_file: None,
             history_retention: None, // keep all
+            keep_history_on_arr_delete: true,
             max_active_downloads: 1,
             max_post_processing_jobs: default_max_post_processing_jobs(),
             max_repair_workers: default_max_repair_workers(),
@@ -232,7 +400,10 @@ impl Default for GeneralConfig {
             required_completion_pct: default_required_completion_pct(),
             article_timeout_secs: default_article_timeout_secs(),
             auto_sort_remaining_pct: false,
+            duplicate_policy: DuplicatePolicy::Warn,
             rss_downloaded_item_expiry_days: None,
+            local_import_dir: None,
+            queue_complete_pers: false,
             scripts_dir: None,
             script_success: None,
             script_failure: None,
@@ -241,13 +412,15 @@ impl Default for GeneralConfig {
             fetch_allow_private: false,
             fetch_allowed_hosts: Vec::new(),
             group_max_headers: default_group_max_headers(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
 
 /// OpenTelemetry configuration. All values can be overridden via env vars.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct OtelConfig {
     /// Enable both OTEL logs and metrics. Retained as a shared fallback for
     /// existing configs; prefer the per-signal fields below for new setups.
@@ -303,11 +476,12 @@ impl OtelConfig {
 pub use nzb_nntp::ServerConfig;
 
 /// Category configuration for organizing downloads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CategoryConfig {
     /// Category name
     pub name: String,
     /// Output directory override (relative to complete_dir)
+    #[schema(value_type = Option<String>)]
     pub output_dir: Option<PathBuf>,
     /// Post-processing level: 0=none, 1=repair, 2=unpack, 3=repair+unpack
     pub post_processing: u8,
@@ -356,7 +530,7 @@ impl CategoryConfig {
 }
 
 /// RSS feed configuration for automatic NZB downloading.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RssFeedConfig {
     /// Display name for the feed
     pub name: String,
@@ -393,9 +567,45 @@ fn default_true() -> bool {
     true
 }
 
-/// DAV pipeline auto-send configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Outbound notifications for completed, failed and disk-full events.
+///
+/// Each target is off until its URL or topic is set. Targets are read at
+/// startup, so a change takes effect after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(default)]
+pub struct NotificationConfig {
+    /// Generic webhook: each event is POSTed as a JSON document.
+    pub webhook_url: String,
+    /// Apprise API notify endpoint, for example `http://apprise:8000/notify`
+    /// or `http://apprise:8000/notify/<key>`. Empty disables Apprise.
+    pub apprise_api_url: String,
+    /// Apprise notification URLs (comma-separated) sent with each message.
+    /// Leave empty when the endpoint already carries a configuration key.
+    pub apprise_urls: String,
+    /// ntfy server base URL.
+    pub ntfy_server: String,
+    /// ntfy topic to publish to. Empty disables ntfy.
+    pub ntfy_topic: String,
+    /// Optional ntfy access token, sent as a bearer token.
+    pub ntfy_token: String,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: String::new(),
+            apprise_api_url: String::new(),
+            apprise_urls: String::new(),
+            ntfy_server: "https://ntfy.sh".to_string(),
+            ntfy_topic: String::new(),
+            ntfy_token: String::new(),
+        }
+    }
+}
+
+/// DAV pipeline auto-send configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct DavConfig {
     /// Whether the WebDAV media library is mounted at runtime.
     pub enabled: bool,
@@ -417,16 +627,132 @@ pub struct DavConfig {
     /// don't support Basic but accept a custom header).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Percent of each server's `connections` set aside for WebDAV playback
+    /// and import while the library is enabled (rounded up; the downloader
+    /// always keeps at least one). The downloader and WebDAV share one
+    /// allowance per server, so this is what keeps playback responsive
+    /// during a download. Playback may borrow more while downloads are idle.
+    pub playback_reserve_pct: u8,
+}
+
+/// Default for [`DavConfig::playback_reserve_pct`].
+pub const DEFAULT_DAV_PLAYBACK_RESERVE_PCT: u8 = 25;
+
+impl Default for DavConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_send_all: false,
+            category_rules: Vec::new(),
+            username: None,
+            password: None,
+            api_key: None,
+            playback_reserve_pct: DEFAULT_DAV_PLAYBACK_RESERVE_PCT,
+        }
+    }
 }
 
 impl AppConfig {
+    /// The config path used when none is given: an absolute path under the
+    /// user's config directory (`$XDG_CONFIG_HOME/rustnzb/config.toml`, else
+    /// `~/.config/rustnzb/config.toml`). Falls back to `config.toml` in the
+    /// current directory, made absolute, when neither variable is usable.
+    pub fn default_path() -> PathBuf {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute());
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(".config"));
+        match xdg.or(home) {
+            Some(dir) => dir.join("rustnzb").join("config.toml"),
+            None => std::path::absolute("config.toml").unwrap_or_else(|_| "config.toml".into()),
+        }
+    }
+
+    /// Read and parse an existing config file. Unknown keys and malformed
+    /// values fail here, and the error names the file. Does not create the
+    /// file and does not validate values; see [`AppConfig::validate`].
+    pub fn read(path: &std::path::Path) -> anyhow::Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let mut config: AppConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        config.assign_missing_server_ids();
+        config.general.rss_downloaded_item_expiry_days =
+            normalize_rss_expiry_days(config.general.rss_downloaded_item_expiry_days);
+        Ok(config)
+    }
+
+    /// Check values that the parser cannot: each returned string is one
+    /// problem, phrased with the setting's path. An empty list means the
+    /// config can run. Category rules are checked separately, by
+    /// [`CategoryConfig::validate`], because startup only warns about them.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.general.port == 0 {
+            problems.push("general.port must be between 1 and 65535".to_string());
+        }
+        if self.general.listen_addr.trim().is_empty() {
+            problems.push("general.listen_addr must not be empty".to_string());
+        }
+        for (i, entry) in self.general.trusted_proxies.iter().enumerate() {
+            if parse_ip_network(entry.trim()).is_none() {
+                problems.push(format!(
+                    "general.trusted_proxies[{i}] ({entry}) must be an IP address or CIDR block"
+                ));
+            }
+        }
+        let mut seen_ids = std::collections::HashSet::new();
+        for (i, server) in self.servers.iter().enumerate() {
+            let label = format!("servers[{i}] ({})", server.id);
+            if server.host.trim().is_empty() {
+                problems.push(format!("{label}: host must not be empty"));
+            }
+            if server.port == 0 {
+                problems.push(format!("{label}: port must be between 1 and 65535"));
+            }
+            if server.connections == 0 {
+                problems.push(format!("{label}: connections must be at least 1"));
+            }
+            if !seen_ids.insert(server.id.as_str()) {
+                problems.push(format!("{label}: duplicate server id"));
+            }
+        }
+        if self.dav.playback_reserve_pct > 100 {
+            problems.push("dav.playback_reserve_pct must be between 0 and 100".to_string());
+        }
+        for (i, rule) in self.schedule.rules.iter().enumerate() {
+            if let Some(problem) = crate::schedule::rule_problem(rule) {
+                problems.push(format!("schedule.rules[{i}] ({}): {problem}", rule.id));
+            }
+        }
+        for (i, feed) in self.rss_feeds.iter().enumerate() {
+            if let Some(pattern) = feed.filter_regex.as_deref()
+                && let Err(e) = regex::Regex::new(pattern)
+            {
+                problems.push(format!(
+                    "rss_feeds[{i}] ({}): filter_regex does not compile: {e}",
+                    feed.name
+                ));
+            }
+        }
+        problems
+    }
+
     /// Load config from a TOML file, creating default if it doesn't exist.
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         if path.exists() {
-            let contents = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-            let mut config: AppConfig = toml::from_str(&contents)?;
-            config.assign_missing_server_ids();
+            let mut config = Self::read(path)?;
+            if config.config_version < crate::config_store::CONFIG_VERSION {
+                // Saving backs up the old file first. A read-only file still
+                // loads; the upgrade is then applied on the next save.
+                crate::config_store::migrate(&mut config);
+                if let Err(e) = config.save(path) {
+                    tracing::warn!(error = %e, "could not write upgraded config file");
+                }
+            }
             Ok(config)
         } else {
             let config = AppConfig::default();
@@ -460,17 +786,13 @@ impl AppConfig {
         }
     }
 
-    /// Save config to a TOML file.
+    /// Save this config as the file layer of `path`.
+    ///
+    /// Comments and formatting already in the file are kept, the write is
+    /// atomic and private, and the previous file is backed up. See
+    /// [`crate::config_store::write_file_layer`].
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
-            })?;
-        }
-        let contents = toml::to_string_pretty(self)?;
-        std::fs::write(path, &contents)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
-        Ok(())
+        crate::config_store::write_file_layer(self, path)
     }
 
     /// Find a category by name.
@@ -497,6 +819,14 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn par2_trust_inflight_verify_defaults_on_and_can_be_disabled() {
+        assert!(Par2Config::default().trust_inflight_verify);
+        let off: Par2Config = toml::from_str("trust_inflight_verify = false").unwrap();
+        assert!(!off.trust_inflight_verify);
+        assert!(off.defer_volumes);
+    }
+
     use super::*;
 
     #[test]
@@ -570,6 +900,56 @@ ssl = false
         assert_eq!(cfg.rss_history_limit, Some(500));
         assert!(cfg.direct_unpack);
         assert_eq!(cfg.max_nested_archive_depth, 5);
+    }
+
+    #[test]
+    fn duplicate_policy_defaults_to_warn_and_parses_known_values() {
+        assert_eq!(
+            GeneralConfig::default().duplicate_policy,
+            DuplicatePolicy::Warn
+        );
+        assert_eq!("Skip".parse::<DuplicatePolicy>(), Ok(DuplicatePolicy::Skip));
+        assert_eq!(
+            " allow ".parse::<DuplicatePolicy>(),
+            Ok(DuplicatePolicy::Allow)
+        );
+        assert!("ignore".parse::<DuplicatePolicy>().is_err());
+
+        let general: GeneralConfig = toml::from_str("duplicate_policy = \"skip\"").unwrap();
+        assert_eq!(general.duplicate_policy, DuplicatePolicy::Skip);
+        let omitted: GeneralConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.duplicate_policy, DuplicatePolicy::Warn);
+    }
+
+    #[test]
+    fn rss_expiry_is_clamped_to_a_computable_cutoff() {
+        assert_eq!(normalize_rss_expiry_days(None), None);
+        assert_eq!(normalize_rss_expiry_days(Some(0)), Some(0));
+        assert_eq!(normalize_rss_expiry_days(Some(30)), Some(30));
+        assert_eq!(
+            normalize_rss_expiry_days(Some(u64::MAX)),
+            Some(MAX_RSS_EXPIRY_DAYS)
+        );
+    }
+
+    #[test]
+    fn read_clamps_an_absurd_rss_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[general]\nrss_downloaded_item_expiry_days = {}\n",
+                u64::MAX
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::read(&path).unwrap();
+        assert_eq!(
+            config.general.rss_downloaded_item_expiry_days,
+            Some(MAX_RSS_EXPIRY_DAYS)
+        );
     }
 
     #[test]
@@ -778,6 +1158,10 @@ ssl = false
         assert!(cfg.dav.username.is_none());
         assert!(cfg.dav.password.is_none());
         assert!(cfg.dav.api_key.is_none());
+        assert_eq!(
+            cfg.dav.playback_reserve_pct,
+            DEFAULT_DAV_PLAYBACK_RESERVE_PCT
+        );
     }
 
     #[test]
@@ -811,6 +1195,132 @@ ssl = false
         assert!(dav.username.is_none());
         assert!(dav.password.is_none());
         assert!(dav.api_key.is_none());
+        assert_eq!(dav.playback_reserve_pct, DEFAULT_DAV_PLAYBACK_RESERVE_PCT);
+    }
+
+    #[test]
+    fn read_rejects_unknown_keys_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\nprot = 9090\n").unwrap();
+
+        let err = format!("{:#}", AppConfig::read(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("unknown field `prot`"), "{err}");
+    }
+
+    #[test]
+    fn read_does_not_create_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+
+        assert!(AppConfig::read(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn default_config_and_example_config_validate_and_parse_strictly() {
+        assert!(AppConfig::default().validate().is_empty());
+
+        let example = include_str!("../../../apps/rustnzb/config.example.toml");
+        let config: AppConfig = toml::from_str(example).unwrap();
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn validate_checks_each_trusted_proxy_entry() {
+        let mut cfg = AppConfig::default();
+        cfg.general.trusted_proxies = vec![
+            "172.18.0.5".into(),
+            "10.0.0.0/8".into(),
+            "fd00::/8".into(),
+            "caddy".into(),
+            "10.0.0.0/33".into(),
+        ];
+        assert_eq!(
+            cfg.validate(),
+            vec![
+                "general.trusted_proxies[3] (caddy) must be an IP address or CIDR block",
+                "general.trusted_proxies[4] (10.0.0.0/33) must be an IP address or CIDR block",
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_reports_each_bad_value_with_its_path() {
+        let mut cfg = AppConfig::default();
+        cfg.general.port = 0;
+        cfg.general.listen_addr = "  ".into();
+        let mut first = ServerConfig::new("dup", "news.example.com");
+        first.connections = 0;
+        let mut second = ServerConfig::new("dup", "");
+        second.port = 0;
+        cfg.servers = vec![first, second];
+        cfg.rss_feeds.push(RssFeedConfig {
+            name: "Bad".into(),
+            url: "https://example.com/rss".into(),
+            poll_interval_secs: 900,
+            category: None,
+            filter_regex: Some("(unclosed".into()),
+            enabled: true,
+            auto_download: false,
+            max_age_days: None,
+        });
+
+        let problems = cfg.validate();
+        for expected in [
+            "general.port",
+            "general.listen_addr",
+            "servers[0] (dup): connections",
+            "servers[1] (dup): host",
+            "servers[1] (dup): port",
+            "servers[1] (dup): duplicate server id",
+            "rss_feeds[0] (Bad): filter_regex",
+        ] {
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "missing {expected:?} in {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_names_a_bad_schedule_rule_by_index_and_id() {
+        let mut cfg = AppConfig::default();
+        cfg.schedule.rules.push(crate::schedule::ScheduleRule {
+            id: "quiet".into(),
+            days: vec!["funday".into()],
+            ..Default::default()
+        });
+
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("schedule.rules[0] (quiet):") && p.contains("funday")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn default_path_is_absolute() {
+        assert!(AppConfig::default_path().is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_owner_only_even_over_a_looser_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        AppConfig::default().save(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
