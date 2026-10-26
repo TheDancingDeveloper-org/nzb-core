@@ -1,6 +1,6 @@
 [package]
 name = "nzb-core"
-version = "0.2.19"
+version = "0.2.23"
 edition = "2024"
 description = "Shared models, config, NZB parser, and SQLite database for NZB clients"
 license = "MIT"
@@ -12,10 +12,12 @@ default = []
 groups-db = []
 
 [dependencies]
-nzb-nntp = { version = "0.2.26" }
+nzb-nntp = { version = "0.2.27" }
 serde = { version = "1", features = ["derive"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 serde_json = "1"
 toml = "1.1"
+toml_edit = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -24,7 +26,9 @@ anyhow = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 quick-xml = "0.41"
+regex = "1"
 unicode-normalization = "0.1"
+sha2 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
